@@ -417,10 +417,10 @@ function analyserEnabled(template) {
 }
 
 /** DIRECT TILE — master prompt + slot number (+ analysis) + both photos. */
-async function runDirectTile({ template, jobId, masterPrompt, analysis, uploads, index, tileCount }) {
+async function runDirectTile({ template, jobId, masterPrompt, analysis, uploads, index, tileCount, slotRole }) {
   const g = template.generator || {};
   const human = index + 1;
-  const { prompt, warnings } = buildDirectTilePrompt({ masterPrompt, analysis, index: human, tileCount });
+  const { prompt, warnings } = buildDirectTilePrompt({ masterPrompt, analysis, index: human, tileCount, slotRole });
   warnings.forEach(w => console.warn(`[ecommRunner] tile ${human}: ${w}`));
 
   const adapter = resolveProvider(g.provider);
@@ -449,7 +449,15 @@ async function runDirectTile({ template, jobId, masterPrompt, analysis, uploads,
  * An entry with source:'direct' is rendered from the master prompt alone;
  * any other entry is a planner brief.
  */
-async function generateTiles({ template, jobId, masterPrompt, analysis, tilePlan, uploads, targets, tileCount }) {
+// A tileTaxonomy entry may be a plain string (the normal case) or an object.
+function slotRoleOf(slotRoles, slot) {
+  const r = Array.isArray(slotRoles) ? slotRoles[slot] : null;
+  if (!r) return null;
+  if (typeof r === 'string') return r.trim() || null;
+  return r.role || r.title || JSON.stringify(r);
+}
+
+async function generateTiles({ template, jobId, masterPrompt, analysis, tilePlan, uploads, targets, tileCount, slotRoles }) {
   console.log(`[ecommRunner] generating ${targets.length} tile(s) in parallel — ${TILE_STAGGER_MS}ms stagger, ${(uploads || []).length} reference image(s)`);
 
   const settled = await Promise.allSettled(targets.map(async (slot, k) => {
@@ -458,7 +466,7 @@ async function generateTiles({ template, jobId, masterPrompt, analysis, tilePlan
     const entry = tilePlan[slot];
     const url = await withBackoff(`tile ${slot + 1}`, () => (
       entry && entry.source === 'direct'
-        ? runDirectTile({ template, jobId, masterPrompt, analysis, uploads, index: slot, tileCount })
+        ? runDirectTile({ template, jobId, masterPrompt, analysis, uploads, index: slot, tileCount, slotRole: slotRoleOf(slotRoles, slot) })
         : runGenerator({ template, jobId, masterPrompt, analysis, brief: entry, uploads, index: slot, tileCount })
     ));
     console.log(`[timing] job=${jobId} tile ${slot + 1} ${Date.now() - t0}ms`);
@@ -544,7 +552,12 @@ async function ecommRunner(jobId, messageBody) {
     const useAnalyser = analyserEnabled(template);
     console.log(`[ecommRunner] pipeline mode: ${mode} · analyser ${useAnalyser ? 'ON' : 'OFF'} · ${tileCount} tiles · scope: ${scope}`);
 
-    const { masterPrompt } = await loadPlaybook(category);
+    const { masterPrompt, tileTaxonomy } = await loadPlaybook(category);
+    if (mode === 'direct') {
+      const n = Array.isArray(tileTaxonomy) ? tileTaxonomy.length : 0;
+      if (n < tileCount) console.warn(`[ecommRunner] playbook "${category}" has ${n} tile role(s) for ${tileCount} tiles — slots without a role tend to repeat the same idea`);
+      else console.log(`[ecommRunner] tile roles: ${n} from playbook "${category}"`);
+    }
     const source = INHERITING_KINDS.has(kind) ? await loadSourceState(job) : null;
 
     let analysis, analysisText, tilePlan;
@@ -665,6 +678,7 @@ async function ecommRunner(jobId, messageBody) {
     const tGen = Date.now();
     const settled = await generateTiles({
       template, jobId, masterPrompt, analysis: analysisText, tilePlan, uploads, targets, tileCount,
+      slotRoles: tileTaxonomy,
     });
     mark('generators', tGen);
     console.log(`[timing] job=${jobId} SUMMARY ${JSON.stringify(timings)} total=${Date.now() - startTime}ms`);

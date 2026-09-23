@@ -96,14 +96,29 @@ function singleTileOutputBlock(index, tileCount) {
  * decides the concept itself from the master prompt. Numbered-tile rules in the
  * master prompt (e.g. "TILE 1 — FOP on white") still apply to that slot.
  */
-function directTileOutputBlock(index, tileCount) {
+function directTileOutputBlock(index, tileCount, slotRole) {
+  // slotRole = this slot's line from the playbook's tileTaxonomy[]. Without it,
+  // 8 separate calls each pick "the strongest" idea — the same one — and the
+  // set comes back as 8 near-identical heroes. The role is what keeps them apart.
+  const roleLines = slotRole
+    ? [
+      `THIS TILE'S ROLE — fixed for slot ${index} of ${tileCount}:`,
+      '',
+      String(slotRole).trim(),
+      '',
+      'Deliver exactly this role. Within it, you decide the concept, composition, camera, setting, copy and art direction, to the standard set above.',
+      'Every other tile in the set has a different role, so do not drift into a general hero shot of the product.',
+    ]
+    : [
+      `If the instructions above fix what a numbered tile must be, follow them exactly for tile ${index}.`,
+      `Otherwise, you are the creative director for this tile. Choose the strongest concept for position ${index} of ${tileCount} in the shopper journey: the first tiles stop the shopper and show the product, the middle tiles explain and build desire, the last tiles build trust and close the sale.`,
+    ];
   return [
     '### OUTPUT REQUIREMENT — SINGLE TILE',
     '',
     `Generate ONE single standalone image: tile ${index} of ${tileCount} in the campaign described above.`,
     '',
-    `If the instructions above fix what a numbered tile must be, follow them exactly for tile ${index}.`,
-    `Otherwise, you are the creative director for this tile. Choose the strongest concept for position ${index} of ${tileCount} in the shopper journey: the first tiles stop the shopper and show the product, the middle tiles explain and build desire, the last tiles build trust and close the sale.`,
+    ...roleLines,
     '',
     `The other ${tileCount - 1} tiles are made in separate calls at the same time. Do not try to show them.`,
     '',
@@ -124,14 +139,15 @@ function directTileOutputBlock(index, tileCount) {
  * DIRECT MODE prompt: master prompt (its own 8-image output block replaced) →
  * the single-tile block → the analysis at the very end, if the analyser ran.
  */
-function buildDirectTilePrompt({ masterPrompt, analysis, index, tileCount }) {
+function buildDirectTilePrompt({ masterPrompt, analysis, index, tileCount, slotRole }) {
   const warnings = [];
+  if (!slotRole) warnings.push(`no tile role for slot ${index} — without one, tiles tend to repeat the same idea.`);
   const { brain, found } = stripOutputRequirement(masterPrompt);
   if (!found) {
     warnings.push('masterPrompt has no OUTPUT heading — its 8-image block could not be replaced, so this tile may come back as a collage.');
   }
   const analysisText = renderAnalysis(analysis);
-  const parts = [brain, '', directTileOutputBlock(index, tileCount)];
+  const parts = [brain, '', directTileOutputBlock(index, tileCount, slotRole)];  
   if (analysisText) {
     parts.push(
       '',
