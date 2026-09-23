@@ -21,16 +21,24 @@ const axios = require('axios');
 // sent to the provider — override here if the provider's callable id differs from the
 // workbook id.
 const MODEL_ROUTING = {
-  'gemini-2.5-flash': { backend: 'gemini',    apiModelId: 'gemini-2.5-flash' },
-  'claude-opus-4-7':  { backend: 'anthropic', apiModelId: 'claude-opus-4-7' },
-  'gpt-5.4':          { backend: 'openai',    apiModelId: 'gpt-5.4' },
+  'gemini-2.5-flash':   { backend: 'gemini',    apiModelId: 'gemini-2.5-flash' },
+  'claude-opus-4-7':    { backend: 'anthropic', apiModelId: 'claude-opus-4-7' },
+  'gpt-5.4':            { backend: 'openai',    apiModelId: 'gpt-5.4' },
   'gpt-5.4-2026-03-05': { backend: 'openai',    apiModelId: 'gpt-5.4-2026-03-05' },
+  'gpt-5.6-sol':        { backend: 'openai',    apiModelId: 'gpt-5.6-sol' },
 };
 
 const DEFAULT_TEXT_MODEL = 'gemini-2.5-flash';
 
 function resolveRouting(modelId) {
-  return MODEL_ROUTING[modelId] || MODEL_ROUTING[DEFAULT_TEXT_MODEL];
+  if (modelId === undefined || modelId === null || modelId === '') {
+    return MODEL_ROUTING[DEFAULT_TEXT_MODEL];
+  }
+  const route = MODEL_ROUTING[modelId];
+  if (!route) {
+    throw new Error(`[textModel] unknown modelId "${modelId}" (known: ${Object.keys(MODEL_ROUTING).join(', ')}) — add it to MODEL_ROUTING after a real call`);
+  }
+  return route;
 }
 
 // Download an image URL → { mimeType, base64 }. Shared by the vision-capable backends.

@@ -3,7 +3,22 @@ const FormData = require('form-data');
 const sharp = require('sharp');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { uploadBufferToS3 } = require('../core/s3Uploader');
-const OPENAI_IMAGE_MODEL_OVERRIDE = 'gpt-image-2';
+
+const OPENAI_IMAGE_MODELS = {
+  'gpt-image-2':         { qualities: ['low', 'medium', 'high', 'auto'],                 maxPixels: null },
+  'gpt-image-2.5-flare': { qualities: ['low', 'medium', 'high', 'xhigh', 'max', 'auto'], maxPixels: 8294400 },
+};
+const DEFAULT_OPENAI_IMAGE_MODEL = 'gpt-image-2';
+// Env fallback only — the template's generator.model always wins now.
+const OPENAI_IMAGE_MODEL_FALLBACK = process.env.OPENAI_IMAGE_MODEL_OVERRIDE || DEFAULT_OPENAI_IMAGE_MODEL;
+
+function resolveImageModel(model) {
+  const id = (typeof model === 'string' && model.trim()) ? model.trim() : OPENAI_IMAGE_MODEL_FALLBACK;
+  if (!OPENAI_IMAGE_MODELS[id]) {
+    throw new Error(`[openai_image] unknown image model "${id}" (known: ${Object.keys(OPENAI_IMAGE_MODELS).join(', ')}) — add it to OPENAI_IMAGE_MODELS after a real generate call`);
+  }
+  return id;
+}
 const MAX_INPUT_EDGE = 1536;
 const INPUT_JPEG_QUALITY = 90;
 const OUTPUT_FORMAT = (() => {
@@ -31,11 +46,24 @@ function resolveSize(aspectRatio, resolution) {
   return byRatio[res] || byRatio['1k'] || '1024x1024';
 }
 
-// Normalize quality to OpenAI's accepted values. The Images API for the GPT image
-// model accepts 'high' | 'medium' | 'low' (and 'auto'); pass through, default high.
-function normalizeQuality(q) {
-  const v = (q || 'medium').toLowerCase();
-  return ['high', 'medium', 'low', 'auto'].includes(v) ? v : 'medium';
+// Normalize quality per model. A value the model does not accept (e.g. 'max' on
+// gpt-image-2) steps down to 'high' with a warning, never silently to 'medium'.
+function normalizeQuality(q, modelId) {
+  const allowed = OPENAI_IMAGE_MODELS[modelId].qualities;
+  const v = String(q || 'high').toLowerCase();
+  if (allowed.includes(v)) return v;
+  console.warn(`[openai_image] quality "${v}" not supported by ${modelId} — using "high"`);
+  return 'high';
+}
+
+// Shrink a "WxH" size to fit a model's total-pixel budget, keeping the aspect ratio.
+// Both edges are floored to a multiple of 16. e.g. 3840x3840 → 2880x2880 on Flare.
+function capToPixelBudget(size, maxPixels) {
+  const [w, h] = String(size).split('x').map(n => parseInt(n, 10));
+  if (!maxPixels || !w || !h || w * h <= maxPixels) return size;
+  const k = Math.sqrt(maxPixels / (w * h));
+  const fit = (n) => Math.max(16, Math.floor((n * k) / 16) * 16);
+  return `${fit(w)}x${fit(h)}`;
 }
 // Gather every image URL this call should attach, in a DETERMINISTIC order:
 //   [ ...product images (front, back, ...), ...template reference creatives ]
@@ -304,8 +332,8 @@ async function execute({ prompt, inputs, imageUrls, model, quality, resolution, 
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('[openai_image] OPENAI_API_KEY not set');
 
-  const modelId = OPENAI_IMAGE_MODEL_OVERRIDE || model || 'gpt-image-2';
-  const qualityVal = normalizeQuality(quality);
+  const modelId = resolveImageModel(model);
+  const qualityVal = normalizeQuality(quality, modelId);
 
   const aspectRatio =
     (inputs && (inputs.aspectRatio || inputs.aspect_ratio)) ||
@@ -316,7 +344,9 @@ async function execute({ prompt, inputs, imageUrls, model, quality, resolution, 
     (inputs && inputs.resolution) ||
     (userInputs && userInputs.resolution) ||
     '1k';
-  const size = resolveSize(aspectRatio, resolutionVal);
+  const tableSize = resolveSize(aspectRatio, resolutionVal);
+  const size = capToPixelBudget(tableSize, OPENAI_IMAGE_MODELS[modelId].maxPixels);
+  if (size !== tableSize) console.log(`[openai_image] ${tableSize} is over ${modelId}'s pixel budget → ${size}`);
 
   console.log(`[openai_image] model: ${modelId}, quality: ${qualityVal}, aspectRatio: ${aspectRatio}, resolution: ${resolutionVal}, size: ${size}`);
 
