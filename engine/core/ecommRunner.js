@@ -416,6 +416,89 @@ function analyserEnabled(template) {
   return a.enabled !== false;
 }
 
+/* ── ROLE PICKER (direct mode, when the playbook has no fixed tile roles) ─────
+ * The sheet flow worked because all 8 tiles were decided in ONE image, so they
+ * could not repeat each other. Eight separate image calls cannot see each other.
+ * This is that shared decision, made once in text instead of in a 16:9 image:
+ * one call reads the master prompt + photos (+ analysis) and picks the N best,
+ * all-different tile stories for THIS product. Each tile then gets its own.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+function rolePickerInstruction(tileCount) {
+  return [
+    'Do NOT generate any images on this call.',
+    '',
+    `Your only job right now is to decide the ${tileCount} tiles of this campaign for THIS product — as the creative director described above would. You pick the ${tileCount} most powerful, most different visual stories this specific product needs.`,
+    '',
+    `Each tile will later be made by a separate image call that sees the full instructions above, the product photos and ONLY its own role. So each role must name one clear story that no other tile tells.`,
+    '',
+    'RULES',
+    `* Exactly ${tileCount} tiles, in the order a shopper should see them.`,
+    '* Every tile answers a DIFFERENT shopper question. No two tiles tell the same story, show the same scene, or make the same point.',
+    '* If the instructions above fix what a numbered tile must be, keep that tile exactly as stated.',
+    '* A role says WHAT the tile shows and WHY (the shopper question it answers). Leave camera, lighting, layout and exact copy to the tile itself.',
+    '* Use only facts that are on the pack or in the product analysis. Never invent claims.',
+    '* Each role stands alone. Never write "as above", "same as tile 2", or refer to another tile.',
+    '',
+    'Return JSON only, nothing before or after it:',
+    '{"tiles":[{"index":1,"title":"2–4 word tile name","role":"One or two sentences: what this tile shows and the shopper question it answers."}]}',
+  ].join('\n');
+}
+
+function validateRoles(parsed, tileCount) {
+  const errors = [];
+  const tiles = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.tiles) ? parsed.tiles : null);
+  if (!tiles) return { tiles: null, errors: ['response has no `tiles` array'] };
+  if (tiles.length !== tileCount) errors.push(`returned ${tiles.length} tiles, expected exactly ${tileCount}`);
+  const seen = new Map();
+  tiles.forEach((t, i) => {
+    const role = t && typeof t.role === 'string' ? t.role.trim() : '';
+    if (!role) { errors.push(`tile ${i + 1}: missing "role"`); return; }
+    if (/\b(as above|same as tile|see tile|previous tile|like tile \d)\b/i.test(role)) {
+      errors.push(`tile ${i + 1}: refers to another tile — each role must stand alone`);
+    }
+    const key = role.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    if (seen.has(key)) errors.push(`tile ${i + 1} repeats tile ${seen.get(key)}`);
+    else seen.set(key, i + 1);
+  });
+  return { tiles, errors };
+}
+
+/** One text call → N different tile roles for this product. One retry, then fail loudly. */
+async function runRolePicker({ template, masterPrompt, analysisText, uploads, tileCount }) {
+  const p = template.planner || {};
+  const call = (correction) => callAgent({
+    label: correction ? 'role-picker-retry' : 'role-picker',
+    prompt: masterPrompt,                         // WHOLE, like the planner: it is the brief for choosing
+    model: p.model,
+    images: uploads || [],
+    attachments: [
+      ...(analysisText ? [{ title: 'PRODUCT ANALYSIS', content: analysisText }] : []),
+      {
+        title: 'YOUR TASK ON THIS CALL',
+        content: correction
+          ? `${rolePickerInstruction(tileCount)}\n\n### RETRY\n\nYour previous answer was rejected: ${correction}\n\nReturn corrected JSON only.`
+          : rolePickerInstruction(tileCount),
+      },
+    ],
+    expectJson: true,
+    maxOutputTokens: 16000,                       // reasoning tokens count against this
+  });
+
+  let { tiles, errors } = validateRoles(await call(null), tileCount);
+  if (errors.length) {
+    console.warn(`[ecommRunner] role picker rejected:\n  - ${errors.join('\n  - ')}`);
+    ({ tiles, errors } = validateRoles(await call(errors.join('; ')), tileCount));
+    if (errors.length) throw new Error(`role picker failed twice:\n  - ${errors.join('\n  - ')}`);
+  }
+  const out = tiles.map((t, i) => ({
+    title: (t.title && String(t.title).trim()) || `Tile ${i + 1}`,
+    role: String(t.role).trim(),
+  }));
+  out.forEach((t, i) => console.log(`[ecommRunner]   role ${i + 1}. ${t.title} — ${t.role.slice(0, 90)}`));
+  return out;
+}
+
 /** DIRECT TILE — master prompt + slot number (+ analysis) + both photos. */
 async function runDirectTile({ template, jobId, masterPrompt, analysis, uploads, index, tileCount, slotRole }) {
   const g = template.generator || {};
@@ -466,7 +549,7 @@ async function generateTiles({ template, jobId, masterPrompt, analysis, tilePlan
     const entry = tilePlan[slot];
     const url = await withBackoff(`tile ${slot + 1}`, () => (
       entry && entry.source === 'direct'
-        ? runDirectTile({ template, jobId, masterPrompt, analysis, uploads, index: slot, tileCount, slotRole: slotRoleOf(slotRoles, slot) })
+        ? runDirectTile({ template, jobId, masterPrompt, analysis, uploads, index: slot, tileCount, slotRole: (entry && entry.role) || slotRoleOf(slotRoles, slot) })
         : runGenerator({ template, jobId, masterPrompt, analysis, brief: entry, uploads, index: slot, tileCount })
     ));
     console.log(`[timing] job=${jobId} tile ${slot + 1} ${Date.now() - t0}ms`);
@@ -555,8 +638,8 @@ async function ecommRunner(jobId, messageBody) {
     const { masterPrompt, tileTaxonomy } = await loadPlaybook(category);
     if (mode === 'direct') {
       const n = Array.isArray(tileTaxonomy) ? tileTaxonomy.length : 0;
-      if (n < tileCount) console.warn(`[ecommRunner] playbook "${category}" has ${n} tile role(s) for ${tileCount} tiles — slots without a role tend to repeat the same idea`);
-      else console.log(`[ecommRunner] tile roles: ${n} from playbook "${category}"`);
+      if (n >= tileCount) console.log(`[ecommRunner] tile roles: ${n} FIXED from playbook "${category}"`);
+      else console.log(`[ecommRunner] tile roles: AUTO — playbook "${category}" has ${n} fixed role(s), so the role picker will choose ${tileCount}`);
     }
     const source = INHERITING_KINDS.has(kind) ? await loadSourceState(job) : null;
 
@@ -621,17 +704,31 @@ async function ecommRunner(jobId, messageBody) {
 
       // ── STAGE 2 · planner (v5 only — direct mode has no briefs) ───────────
       if (mode === 'direct') {
-        // One placeholder per slot, so regen_one, /set and the status routes
-        // (which read tilePlan titles) work unchanged.
-        tilePlan = Array.from({ length: tileCount }, (_, i) => ({ index: i + 1, title: `Tile ${i + 1}`, source: 'direct' }));
+        // Roles: FIXED from the playbook when it has one per tile, otherwise
+        // AUTO — one text call picks N different stories for this product.
+        // Stored on tilePlan so regen_one re-renders a tile with the SAME role.
+        const fixed = (Array.isArray(tileTaxonomy) ? tileTaxonomy : [])
+          .map((r, i) => slotRoleOf(tileTaxonomy, i)).filter(Boolean);
+        let roles;
+        if (fixed.length >= tileCount) {
+          roles = fixed.slice(0, tileCount).map((role, i) => ({ title: `Tile ${i + 1}`, role, rolesFrom: 'playbook' }));
+        } else {
+          await updateJobStatus(jobId, { status: 'stage_planner', currentStepLabel: `Choosing the ${tileCount} best tiles...` });
+          const tPick = Date.now();
+          roles = (await runRolePicker({ template, masterPrompt, analysisText, uploads, tileCount }))
+            .map((r) => ({ ...r, rolesFrom: 'auto' }));
+          mark('role-picker', tPick);
+        }
+        tilePlan = roles.map((r, i) => ({ index: i + 1, title: r.title, role: r.role, rolesFrom: r.rolesFrom, source: 'direct' }));
         await updateJobStatus(jobId, { tilePlan });
+
         if (scope === 'planner') {
-          // Direct mode has no planner. Never let this button spend 8 images.
           await updateJobStatus(jobId, {
-            status: 'complete', currentStepLabel: 'Direct mode has no planner step',
+            status: 'complete', currentStepLabel: 'Tile roles chosen',
             jobDurationMs: Date.now() - startTime, completedAt: new Date().toISOString(),
           });
-          return { success: true, jobId, stage: 'planner', skipped: true };
+          console.log(`[ecommRunner] ===== Job ${jobId} — roles-only test COMPLETE =====\n`);
+          return { success: true, jobId, stage: 'roles', tilePlan };
         }
       } else {
         // ── STAGE 2 · planner ─────────────────────────────────────────────────
@@ -704,7 +801,7 @@ async function ecommRunner(jobId, messageBody) {
 module.exports = {
   ecommRunner,
   runAnalyser, runPlanner, runGenerator,
-  runDirectTile, pipelineModeOf, analyserEnabled,
+  runDirectTile, pipelineModeOf, analyserEnabled, runRolePicker, validateRoles,
   // exported for the admin test routes and for unit tests
   clampTileCount, resolveUploads, mergeOutputs, assertAnalysis, loadPlaybook,
 };

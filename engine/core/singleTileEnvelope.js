@@ -36,9 +36,10 @@ const OUTPUT_REQUIREMENT_HEADING = '### OUTPUT REQUIREMENT';
  * the discarded multi-image tail.
  * @returns {{ brain: string, tail: string, found: boolean }}
  */
-// Also accept the strategist's newer heading style: a line that is just
-// "# OUTPUT", "## OUTPUT" or "### OUTPUT REQUIREMENT" (any 1–4 #'s).
-const OUTPUT_HEADING_RE = /^#{1,4}[ \t]*OUTPUT(?:[ \t]+REQUIREMENT)?[ \t]*$/m;
+// Accept every heading style the prompts arrive in: "### OUTPUT REQUIREMENT",
+// "# OUTPUT", and a plain "OUTPUT REQUIREMENT" / "OUTPUT" line with no #'s
+// (what a prompt copied out of a rich-text editor looks like).
+const OUTPUT_HEADING_RE = /^(?:#{1,4}[ \t]*)?OUTPUT(?:[ \t]+REQUIREMENT)?[ \t]*$/m;
 
 function stripOutputRequirement(masterPrompt) {
   const src = String(masterPrompt || '');
@@ -102,7 +103,7 @@ function directTileOutputBlock(index, tileCount, slotRole) {
   // set comes back as 8 near-identical heroes. The role is what keeps them apart.
   const roleLines = slotRole
     ? [
-      `THIS TILE'S ROLE — fixed for slot ${index} of ${tileCount}:`,
+      `THIS TILE'S ROLE — slot ${index} of ${tileCount}:`,
       '',
       String(slotRole).trim(),
       '',
