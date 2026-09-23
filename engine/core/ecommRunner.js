@@ -160,6 +160,14 @@ function clampTileCount(n) {
 // the image adapter builds labels them by position.
 const IMAGE_ROLES = ['FRONT OF PACK', 'BACK OF PACK'];
 
+// Generator stage: FRONT OF PACK only. The back of pack still goes to the
+// analyser and the role picker (it carries the claims, ingredients and
+// directions), but attaching it to the image calls makes tiles copy the back
+// label and draw a second bottle.
+function generatorRefs(uploads) {
+  return (uploads || []).slice(0, 1);
+}
+
 function resolveUploads(inputFiles) {
   if (Array.isArray(inputFiles)) return inputFiles.filter(Boolean).slice(0, 2);
   if (inputFiles && typeof inputFiles === 'object') {
@@ -374,18 +382,19 @@ async function runGenerator({ template, jobId, masterPrompt, analysis, brief, up
   // multi-image block survived and this tile may come back as a collage.
   warnings.forEach(w => console.warn(`[ecommRunner] tile ${human}: ${w}`));
 
+  const refs = generatorRefs(uploads);
   const adapter = resolveProvider(g.provider);
   const result = await adapter.execute({
     prompt,
-    imageUrls: uploads || [],
+    imageUrls: refs,
     model: g.model || 'gpt-image-2',
     quality: g.quality || 'high',
     resolution: g.resolution || '2k',
     inputs: {
       aspectRatio: g.aspectRatio || '1:1',
-      // Name the two photos by role so the adapter's manifest says
-      // "Image 1 = PRODUCT — FRONT OF PACK" rather than "additional view 2".
-      imageLabels: IMAGE_ROLES.slice(0, (uploads || []).length),
+      // Name the photo by role so the adapter's manifest says
+      // "Image 1 = PRODUCT — FRONT OF PACK".
+      imageLabels: IMAGE_ROLES.slice(0, refs.length),
     },
     // The adapter derives the S3 key from stepId + tileIndex, giving
     // ai-outputs/ecomm_<jobId>_t<n>_0_<ts>.<ext> — §A1's naming, adapter-shaped.
@@ -438,6 +447,7 @@ function rolePickerInstruction(tileCount) {
     '* If the instructions above fix what a numbered tile must be, keep that tile exactly as stated.',
     '* A role says WHAT the tile shows and WHY (the shopper question it answers). Leave camera, lighting, layout and exact copy to the tile itself.',
     '* Use only facts that are on the pack or in the product analysis. Never invent claims.',
+    '* The image calls will see ONLY the front of pack. Never choose a tile that shows the back of the pack or reproduces its printed text.',
     '* Each role stands alone. Never write "as above", "same as tile 2", or refer to another tile.',
     '',
     'Return JSON only, nothing before or after it:',
@@ -506,16 +516,17 @@ async function runDirectTile({ template, jobId, masterPrompt, analysis, uploads,
   const { prompt, warnings } = buildDirectTilePrompt({ masterPrompt, analysis, index: human, tileCount, slotRole });
   warnings.forEach(w => console.warn(`[ecommRunner] tile ${human}: ${w}`));
 
+  const refs = generatorRefs(uploads);
   const adapter = resolveProvider(g.provider);
   const result = await adapter.execute({
     prompt,
-    imageUrls: uploads || [],
+    imageUrls: refs,
     model: g.model || 'gpt-image-2',
     quality: g.quality || 'high',
     resolution: g.resolution || '2k',
     inputs: {
       aspectRatio: g.aspectRatio || '1:1',
-      imageLabels: IMAGE_ROLES.slice(0, (uploads || []).length),
+      imageLabels: IMAGE_ROLES.slice(0, refs.length),
     },
     stepId: `ecomm_${jobId}`,
     tileIndex: human,
@@ -541,7 +552,7 @@ function slotRoleOf(slotRoles, slot) {
 }
 
 async function generateTiles({ template, jobId, masterPrompt, analysis, tilePlan, uploads, targets, tileCount, slotRoles }) {
-  console.log(`[ecommRunner] generating ${targets.length} tile(s) in parallel — ${TILE_STAGGER_MS}ms stagger, ${(uploads || []).length} reference image(s)`);
+  console.log(`[ecommRunner] generating ${targets.length} tile(s) in parallel — ${TILE_STAGGER_MS}ms stagger, ${generatorRefs(uploads).length} reference image(s) (front of pack only)`);
 
   const settled = await Promise.allSettled(targets.map(async (slot, k) => {
     await sleep(k * TILE_STAGGER_MS);
