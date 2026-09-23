@@ -2,7 +2,7 @@ const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const { callAgent } = require('./agentCall');
 const { uploadBufferToS3 } = require('./s3Uploader');
-const { buildSingleTilePrompt } = require('./singleTileEnvelope');
+const { buildSingleTilePrompt, buildDirectTilePrompt } = require('./singleTileEnvelope');
 const { plannerInstruction, validateTilePlan } = require('./plannerContract');
 
 // ─── core/ecommRunner.js ─────────────────────────────────────────── Phase 3 ──
@@ -398,9 +398,56 @@ async function runGenerator({ template, jobId, masterPrompt, analysis, brief, up
   return url;
 }
 
+/* ── DIRECT MODE ──────────────────────────────────────────────────────────────
+ *   FOP + BOP → analyser (optional) → master prompt → N tiles in parallel.
+ *   No planner, no briefs. Each tile gets the master prompt, its slot number,
+ *   the analysis at the end (if the analyser ran) and both photos.
+ * template.pipelineMode: 'direct' | 'planner' (v5).  Missing = 'planner', so
+ * saved templates keep working exactly as before.
+ * template.analyser.enabled: false skips the analyser call (default true).
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+function pipelineModeOf(template) {
+  return String((template && template.pipelineMode) || 'planner').toLowerCase() === 'direct' ? 'direct' : 'planner';
+}
+
+function analyserEnabled(template) {
+  const a = (template && (template.analyser || (template.agents && template.agents.analyser))) || {};
+  return a.enabled !== false;
+}
+
+/** DIRECT TILE — master prompt + slot number (+ analysis) + both photos. */
+async function runDirectTile({ template, jobId, masterPrompt, analysis, uploads, index, tileCount }) {
+  const g = template.generator || {};
+  const human = index + 1;
+  const { prompt, warnings } = buildDirectTilePrompt({ masterPrompt, analysis, index: human, tileCount });
+  warnings.forEach(w => console.warn(`[ecommRunner] tile ${human}: ${w}`));
+
+  const adapter = resolveProvider(g.provider);
+  const result = await adapter.execute({
+    prompt,
+    imageUrls: uploads || [],
+    model: g.model || 'gpt-image-2',
+    quality: g.quality || 'high',
+    resolution: g.resolution || '2k',
+    inputs: {
+      aspectRatio: g.aspectRatio || '1:1',
+      imageLabels: IMAGE_ROLES.slice(0, (uploads || []).length),
+    },
+    stepId: `ecomm_${jobId}`,
+    tileIndex: human,
+  });
+
+  const url = result && result.outputs && result.outputs[0] && result.outputs[0].url;
+  if (!url) throw new Error(`tile ${human}: generator returned no image url`);
+  return url;
+}
+
 /**
- * Fan out over the briefs. Staggered, per-tile isolation, partial success still
+ * Fan out over the tiles. Staggered, per-tile isolation, partial success still
  * completes the job — one dead tile must never cost the other seven.
+ * An entry with source:'direct' is rendered from the master prompt alone;
+ * any other entry is a planner brief.
  */
 async function generateTiles({ template, jobId, masterPrompt, analysis, tilePlan, uploads, targets, tileCount }) {
   console.log(`[ecommRunner] generating ${targets.length} tile(s) in parallel — ${TILE_STAGGER_MS}ms stagger, ${(uploads || []).length} reference image(s)`);
@@ -408,10 +455,12 @@ async function generateTiles({ template, jobId, masterPrompt, analysis, tilePlan
   const settled = await Promise.allSettled(targets.map(async (slot, k) => {
     await sleep(k * TILE_STAGGER_MS);
     const t0 = Date.now();
-    const url = await withBackoff(`tile ${slot + 1}`, () => runGenerator({
-      template, jobId, masterPrompt, analysis,
-      brief: tilePlan[slot], uploads, index: slot, tileCount,
-    }));
+    const entry = tilePlan[slot];
+    const url = await withBackoff(`tile ${slot + 1}`, () => (
+      entry && entry.source === 'direct'
+        ? runDirectTile({ template, jobId, masterPrompt, analysis, uploads, index: slot, tileCount })
+        : runGenerator({ template, jobId, masterPrompt, analysis, brief: entry, uploads, index: slot, tileCount })
+    ));
     console.log(`[timing] job=${jobId} tile ${slot + 1} ${Date.now() - t0}ms`);
     return { i: slot, url };
   }));
@@ -491,6 +540,9 @@ async function ecommRunner(jobId, messageBody) {
     const category = job.category || job.selectedPlaybookKey || template.category;
 
     const scope = (messageBody && messageBody._ecommTestScope) || 'full';   // 'analyser'|'planner'|'tile'|'full'
+    const mode = pipelineModeOf(template);
+    const useAnalyser = analyserEnabled(template);
+    console.log(`[ecommRunner] pipeline mode: ${mode} · analyser ${useAnalyser ? 'ON' : 'OFF'} · ${tileCount} tiles · scope: ${scope}`);
 
     const { masterPrompt } = await loadPlaybook(category);
     const source = INHERITING_KINDS.has(kind) ? await loadSourceState(job) : null;
@@ -502,9 +554,11 @@ async function ecommRunner(jobId, messageBody) {
       // stored brief. No analyser, no planner, no re-deciding the campaign.
       if (!source) throw new Error('regen_one job has no sourceJobId or parentJobId');
       if (!source.tilePlan.length) throw new Error(`source run ${source.jobId} has no tilePlan to re-render from`);
-      if (!source.analysis) throw new Error(`source run ${source.jobId} has no analysis to re-render from`);
+      const isDirect = source.tilePlan.every(t => t && t.source === 'direct');
+      if (!source.analysis && !isDirect) throw new Error(`source run ${source.jobId} has no analysis to re-render from`);
 
-      ({ text: analysisText, obj: analysis } = assertAnalysis(source.analysis, `source run ${source.jobId}`));
+      // A direct run with the analyser off has no analysis — that is fine.
+      if (source.analysis) ({ text: analysisText, obj: analysis } = assertAnalysis(source.analysis, `source run ${source.jobId}`));
       tilePlan = source.tilePlan;
 
       await updateJobStatus(jobId, {
@@ -523,19 +577,25 @@ async function ecommRunner(jobId, messageBody) {
         await updateJobStatus(jobId, { status: 'stage_analyser', currentStepLabel: 'Using your saved product details...' });
         ({ text: analysisText, obj: analysis } = assertAnalysis(card, `SKU card ${job.skuAnalysisId || '(unversioned)'}`));
         console.log(`[ecommRunner] analyser SKIPPED — SKU card ${job.skuAnalysisId || '(unversioned)'} (${card.length} chars)`);
-      } else {
+      } else if (useAnalyser) {
         if (!uploads.length) throw new Error('no product image on the job, and no SKU analysis to fall back on');
         await updateJobStatus(jobId, { status: 'stage_analyser', currentStepLabel: 'Analysing your product...' });
         const t = Date.now();
         const raw = await runAnalyser({ template, uploads });
         mark('analyser', t);
         ({ text: analysisText, obj: analysis } = assertAnalysis(raw, 'analyser'));
+      } else {
+        if (!uploads.length) throw new Error('no product image on the job');
+        if (mode !== 'direct') throw new Error('the analyser is off, but the planner needs an analysis — turn the analyser on or switch to direct mode');
+        console.log('[ecommRunner] analyser OFF — tiles get the master prompt + photos only');
       }
 
-      const stored = await persistLarge(jobId, 'analysis', analysisText);
-      await updateJobStatus(jobId, {
-        ...(stored.inline != null ? { analysisOutput: stored.inline } : { analysisOutput: null, analysisS3Key: stored.key }),
-      });
+      if (analysisText) {
+        const stored = await persistLarge(jobId, 'analysis', analysisText);
+        await updateJobStatus(jobId, {
+          ...(stored.inline != null ? { analysisOutput: stored.inline } : { analysisOutput: null, analysisS3Key: stored.key }),
+        });
+      }
 
       if (scope === 'analyser') {
         await updateJobStatus(jobId, {
@@ -546,24 +606,40 @@ async function ecommRunner(jobId, messageBody) {
         return { success: true, jobId, stage: 'analyser' };
       }
 
-      // ── STAGE 2 · planner ─────────────────────────────────────────────────
-      await updateJobStatus(jobId, { status: 'stage_planner', currentStepLabel: `Planning ${tileCount} tiles...` });
-      const tPlan = Date.now();
-      tilePlan = await runPlanner({ template, masterPrompt, analysisText, uploads, tileCount });
-      mark('planner', tPlan);
+      // ── STAGE 2 · planner (v5 only — direct mode has no briefs) ───────────
+      if (mode === 'direct') {
+        // One placeholder per slot, so regen_one, /set and the status routes
+        // (which read tilePlan titles) work unchanged.
+        tilePlan = Array.from({ length: tileCount }, (_, i) => ({ index: i + 1, title: `Tile ${i + 1}`, source: 'direct' }));
+        await updateJobStatus(jobId, { tilePlan });
+        if (scope === 'planner') {
+          // Direct mode has no planner. Never let this button spend 8 images.
+          await updateJobStatus(jobId, {
+            status: 'complete', currentStepLabel: 'Direct mode has no planner step',
+            jobDurationMs: Date.now() - startTime, completedAt: new Date().toISOString(),
+          });
+          return { success: true, jobId, stage: 'planner', skipped: true };
+        }
+      } else {
+        // ── STAGE 2 · planner ─────────────────────────────────────────────────
+        await updateJobStatus(jobId, { status: 'stage_planner', currentStepLabel: `Planning ${tileCount} tiles...` });
+        const tPlan = Date.now();
+        tilePlan = await runPlanner({ template, masterPrompt, analysisText, uploads, tileCount });
+        mark('planner', tPlan);
 
-      const planStored = await persistLarge(jobId, 'tilePlan', tilePlan);
-      await updateJobStatus(jobId, {
-        ...(planStored.inline != null ? { tilePlan: planStored.inline } : { tilePlan: [], tilePlanS3Key: planStored.key }),
-      });
-
-      if (scope === 'planner') {
+        const planStored = await persistLarge(jobId, 'tilePlan', tilePlan);
         await updateJobStatus(jobId, {
-          status: 'complete', currentStepLabel: 'Planner test complete',
-          jobDurationMs: Date.now() - startTime, completedAt: new Date().toISOString(),
+          ...(planStored.inline != null ? { tilePlan: planStored.inline } : { tilePlan: [], tilePlanS3Key: planStored.key }),
         });
-        console.log(`[ecommRunner] ===== Job ${jobId} — planner-only test COMPLETE =====\n`);
-        return { success: true, jobId, stage: 'planner', tilePlan };
+
+        if (scope === 'planner') {
+          await updateJobStatus(jobId, {
+            status: 'complete', currentStepLabel: 'Planner test complete',
+            jobDurationMs: Date.now() - startTime, completedAt: new Date().toISOString(),
+          });
+          console.log(`[ecommRunner] ===== Job ${jobId} — planner-only test COMPLETE =====\n`);
+          return { success: true, jobId, stage: 'planner', tilePlan };
+        }
       }
     }
 
@@ -614,6 +690,7 @@ async function ecommRunner(jobId, messageBody) {
 module.exports = {
   ecommRunner,
   runAnalyser, runPlanner, runGenerator,
+  runDirectTile, pipelineModeOf, analyserEnabled,
   // exported for the admin test routes and for unit tests
   clampTileCount, resolveUploads, mergeOutputs, assertAnalysis, loadPlaybook,
 };

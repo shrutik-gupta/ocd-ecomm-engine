@@ -36,9 +36,14 @@ const OUTPUT_REQUIREMENT_HEADING = '### OUTPUT REQUIREMENT';
  * the discarded multi-image tail.
  * @returns {{ brain: string, tail: string, found: boolean }}
  */
+// Also accept the strategist's newer heading style: a line that is just
+// "# OUTPUT", "## OUTPUT" or "### OUTPUT REQUIREMENT" (any 1–4 #'s).
+const OUTPUT_HEADING_RE = /^#{1,4}[ \t]*OUTPUT(?:[ \t]+REQUIREMENT)?[ \t]*$/m;
+
 function stripOutputRequirement(masterPrompt) {
   const src = String(masterPrompt || '');
-  const idx = src.indexOf(OUTPUT_REQUIREMENT_HEADING);
+  const m = OUTPUT_HEADING_RE.exec(src);
+  const idx = m ? m.index : -1;
   if (idx === -1) {
     // No heading to cut at. Returning the whole prompt is the honest thing to do
     // — but the caller MUST surface `found:false`, because this is the exact
@@ -84,6 +89,60 @@ function singleTileOutputBlock(index, tileCount) {
     '',
     'MAXIMUM PRODUCT FIDELITY. MAXIMUM PREMIUM PERCEPTION. ZERO GENERIC DESIGN.',
   ].join('\n');
+}
+
+/**
+ * DIRECT MODE output block: no brief. The tile knows only its slot number and
+ * decides the concept itself from the master prompt. Numbered-tile rules in the
+ * master prompt (e.g. "TILE 1 — FOP on white") still apply to that slot.
+ */
+function directTileOutputBlock(index, tileCount) {
+  return [
+    '### OUTPUT REQUIREMENT — SINGLE TILE',
+    '',
+    `Generate ONE single standalone image: tile ${index} of ${tileCount} in the campaign described above.`,
+    '',
+    `If the instructions above fix what a numbered tile must be, follow them exactly for tile ${index}.`,
+    `Otherwise, you are the creative director for this tile. Choose the strongest concept for position ${index} of ${tileCount} in the shopper journey: the first tiles stop the shopper and show the product, the middle tiles explain and build desire, the last tiles build trust and close the sale.`,
+    '',
+    `The other ${tileCount - 1} tiles are made in separate calls at the same time. Do not try to show them.`,
+    '',
+    'DO NOT generate:',
+    '',
+    '* A collage',
+    '* A contact sheet',
+    '* Multiple panels in one image',
+    '* A grid, sheet or strip of variations',
+    '',
+    'One frame. One idea. One finished Amazon PDP/A+ creative.',
+    '',
+    'Do not explain the concept first. Do not ask for approval.',
+  ].join('\n');
+}
+
+/**
+ * DIRECT MODE prompt: master prompt (its own 8-image output block replaced) →
+ * the single-tile block → the analysis at the very end, if the analyser ran.
+ */
+function buildDirectTilePrompt({ masterPrompt, analysis, index, tileCount }) {
+  const warnings = [];
+  const { brain, found } = stripOutputRequirement(masterPrompt);
+  if (!found) {
+    warnings.push('masterPrompt has no OUTPUT heading — its 8-image block could not be replaced, so this tile may come back as a collage.');
+  }
+  const analysisText = renderAnalysis(analysis);
+  const parts = [brain, '', directTileOutputBlock(index, tileCount)];
+  if (analysisText) {
+    parts.push(
+      '',
+      '### PRODUCT ANALYSIS',
+      '',
+      'This is what the product is. The attached photographs are the authority on how it looks — where the two disagree, the photographs win.',
+      '',
+      analysisText,
+    );
+  }
+  return { prompt: parts.join('\n'), warnings };
 }
 
 /** Render the analysis as prompt text, whichever shape it arrived in. */
@@ -174,4 +233,6 @@ module.exports = {
   renderAnalysis,
   renderBrief,
   buildSingleTilePrompt,
+  directTileOutputBlock,
+  buildDirectTilePrompt,
 };
