@@ -22,10 +22,8 @@ const inputs = require('./ecommInputs');
 //   {{subcategory}}             → "Skincare"
 // A line whose tokens all came out empty is removed.
 //
-// Images are resolved per call, because different calls see different images:
-//   analyser + role picker   ALL uploaded images
-//   tile calls               only images with toTiles (front of pack always;
-//                            back of pack off by default; texture / shade on)
+// Images: every uploaded image is attached to every call — analyser, role
+// picker and all tiles. (A field's old `toTiles` flag is ignored.)
 // Every call that carries images opens with an ATTACHED IMAGES list written
 // here, so the image adapter's own manifest is switched off (suppressManifest).
 //
@@ -215,7 +213,7 @@ function prepareRunInputs({ template, job }) {
   if (error) throw new Error(`inputs: ${error}`);
 
   const { images: allImages, ignored } = inputs.imagePlan(fields, job.inputFiles);
-  const tileImages = allImages.filter((im) => im.toTiles);
+  const tileImages = allImages;
   const userInputs = job.userInputs && typeof job.userInputs === 'object' ? job.userInputs : {};
 
   const check = inputs.checkInputs(fields, job.inputFiles, userInputs);
@@ -477,7 +475,7 @@ function rolePickerInstruction(tileCount, tileImageNames) {
     '* If the instructions above fix what a numbered tile must be, keep that tile exactly as stated.',
     '* A role says WHAT the tile shows and WHY (the shopper question it answers). Leave camera, lighting, layout and exact copy to the tile itself.',
     '* Use only facts that are on the pack, in the seller\'s details above, or in the product analysis. Never invent claims.',
-    `* The image calls will see ONLY these images: ${names}. Never choose a tile that needs an image they do not get (for example the back of the pack or its printed text).`,
+    `* The image calls will see these images: ${names}.`,
     '* Refer to images by their NAME (e.g. TEXTURE IMAGE), never by number — the numbers differ between calls.',
     '* Each role stands alone. Never write "as above", "same as tile 2", or refer to another tile.',
     '',
