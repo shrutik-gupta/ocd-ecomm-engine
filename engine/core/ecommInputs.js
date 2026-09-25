@@ -83,9 +83,11 @@ function cleanField(raw) {
   };
   if (type === 'select') {
     const seen = new Set();
-    f.options = (Array.isArray(raw.options) ? raw.options : [])
+    const all = (Array.isArray(raw.options) ? raw.options : [])
       .map((o) => String(o == null ? '' : o).trim())
       .filter((o) => o && !seen.has(o.toLowerCase()) && seen.add(o.toLowerCase()));
+    f.options = all.filter((o) => !/^others?$/i.test(o));
+    f.allowOther = raw.allowOther === true || all.length !== f.options.length;
   }
   if (type === 'text') f.placeholder = String(raw.placeholder || '').trim();
   if (type === 'image') {
@@ -356,7 +358,7 @@ function checkInputs(fields, inputFiles, userInputs) {
     if (f.required && !has) (f.key === MAIN_IMAGE_KEY ? errors : warnings).push(`required input "${f.label}" (${f.key}) is empty`);
     if (f.type === 'select' && has) {
       const v = valueOf(ui, f.key).value;
-      if (f.options && f.options.length && !f.options.includes(v)) warnings.push(`"${f.label}" has "${v}", which is not one of its options`);
+      if (!f.allowOther && f.options && f.options.length && !f.options.includes(v)) warnings.push(`"${f.label}" has "${v}", which is not one of its options`);
     }
   });
   return { errors, warnings };
