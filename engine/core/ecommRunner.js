@@ -9,10 +9,11 @@ const inputs = require('./ecommInputs');
 // ─── core/ecommRunner.js ─────────────────────────────────────────── Phase 3 ──
 //
 // ── v7 (Sep 25, 2026): NO PLAYBOOKS ──────────────────────────────────────────
-// The master prompt lives on the TEMPLATE (template.masterPrompt), not on an
-// EcommPlaybooks row. The template also carries its own customer inputs
-// (template.inputSchema): either one fixed field list (e.g. food & beverage) or
-// one field list per subcategory (e.g. beauty → skincare / haircare / makeup).
+// The master prompt lives on the TEMPLATE, not on an EcommPlaybooks row:
+//   subcategory mode (e.g. beauty → skincare / haircare / makeup): each
+//     subcategory has its OWN fields and its OWN master prompt
+//     (inputSchema.subcategories[i].masterPrompt).
+//   fixed mode (e.g. food & beverage): one field list and template.masterPrompt.
 //
 // The author writes {{tokens}} into the master prompt. Before every call the
 // engine turns it into ONE plain string (ecommInputs.resolveTokens):
@@ -108,12 +109,13 @@ async function loadTemplate(templateId) {
   return r.Item;
 }
 
-// v7: the master prompt is a field on the template. No playbook, no fallback —
-// a template with no prompt is a template the workbook should never have saved.
-function masterPromptOf(template) {
-  const mp = String((template && template.masterPrompt) || '');
+// v7: the run's master prompt — the subcategory's own, or the template's in
+// fixed mode. No playbook, no fallback.
+function masterPromptOf(template, masterPrompt, subcategory) {
+  const mp = String(masterPrompt || '');
   if (!mp.trim()) {
-    throw new Error(`template "${template && template.templateId}" has no masterPrompt — paste it into the Master prompt field in the workbook and save`);
+    const where = subcategory ? `subcategory "${subcategory.label}" of template "${template && template.templateId}"` : `template "${template && template.templateId}"`;
+    throw new Error(`${where} has no master prompt — paste it in the workbook (section 4) and save`);
   }
   return mp;
 }
@@ -209,10 +211,11 @@ async function withBackoff(label, fn, attempts = TILE_RETRY_ATTEMPTS) {
  *   promptTiles   master prompt resolved for a tile call
  */
 function prepareRunInputs({ template, job }) {
-  const { fields, subcategory, error } = inputs.fieldsFor(template, job.subcategory);
+  const { fields, subcategory, masterPrompt, error } = inputs.fieldsFor(template, job.subcategory);
   if (error) throw new Error(`inputs: ${error}`);
 
   const { images: allImages, ignored } = inputs.imagePlan(fields, job.inputFiles);
+  // Every uploaded image goes to every call — analyser, role picker and tiles.
   const tileImages = allImages;
   const userInputs = job.userInputs && typeof job.userInputs === 'object' ? job.userInputs : {};
 
@@ -223,9 +226,9 @@ function prepareRunInputs({ template, job }) {
     throw new Error(`inputs: ${check.errors.join('; ')}`);
   }
 
-  const master = masterPromptOf(template);
-  const allKeys = inputs.allFieldKeys(template);
-  const ctx = { fields, userInputs, subcategory, allKeys };
+  const master = masterPromptOf(template, masterPrompt, subcategory);
+  // Each subcategory has its own prompt, so its tokens must match its own fields.
+  const ctx = { fields, userInputs, subcategory };
 
   const all = inputs.resolveTokens(master, { ...ctx, images: allImages });
   const tiles = inputs.resolveTokens(master, { ...ctx, images: tileImages });

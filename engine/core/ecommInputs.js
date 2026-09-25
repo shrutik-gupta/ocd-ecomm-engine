@@ -10,8 +10,11 @@
  *   EcommWorkbook.js resolveTokens (the "Preview resolved prompt" panel)
  *
  * ── The schema (template.inputSchema) ────────────────────────────────────────
- *   { version: 2, mode: "subcategory", subcategories: [{ key, label, fields: [...] }] }
+ *   { version: 2, mode: "subcategory", subcategories: [{ key, label, masterPrompt, fields: [...] }] }
  *   { version: 2, mode: "fixed",       fields: [...] }
+ *
+ *   Master prompt: subcategory mode → each subcategory has its OWN masterPrompt.
+ *                  fixed mode       → template.masterPrompt.
  *
  *   field = { key, type: "image"|"text"|"select", label, hint, required,
  *             options (select), placeholder (text),
@@ -128,6 +131,7 @@ function schemaOf(template) {
         .map((s) => ({
           key: String((s && s.key) || '').trim(),
           label: String((s && (s.label || s.key)) || '').trim(),
+          masterPrompt: typeof (s && s.masterPrompt) === 'string' ? s.masterPrompt : '',
           fields: cleanFieldList(s && s.fields),
         }))
         .filter((s) => s.key);
@@ -139,20 +143,24 @@ function schemaOf(template) {
 }
 
 /**
- * The fields that apply to this run.
- * @returns {{ fields: object[], subcategory: {key,label}|null, error: string|null }}
+ * The fields and the master prompt that apply to this run.
+ * Subcategory mode: the subcategory's own fields and master prompt.
+ * Fixed mode: the template's fields and template.masterPrompt.
+ * @returns {{ fields: object[], subcategory: {key,label}|null, masterPrompt: string, error: string|null }}
  */
 function fieldsFor(template, subcategoryKey) {
   const schema = schemaOf(template);
-  if (schema.mode === 'fixed') return { fields: schema.fields, subcategory: null, error: null };
+  if (schema.mode === 'fixed') {
+    return { fields: schema.fields, subcategory: null, masterPrompt: String((template && template.masterPrompt) || ''), error: null };
+  }
 
   const want = String(subcategoryKey || '').trim().toLowerCase();
   const sub = schema.subcategories.find((s) => s.key.toLowerCase() === want);
   if (!sub) {
     const known = schema.subcategories.map((s) => s.key).join(', ') || '(none)';
-    return { fields: [], subcategory: null, error: want ? `unknown subcategory "${subcategoryKey}" (this template has: ${known})` : `a subcategory is required (this template has: ${known})` };
+    return { fields: [], subcategory: null, masterPrompt: '', error: want ? `unknown subcategory "${subcategoryKey}" (this template has: ${known})` : `a subcategory is required (this template has: ${known})` };
   }
-  return { fields: sub.fields, subcategory: { key: sub.key, label: sub.label || sub.key }, error: null };
+  return { fields: sub.fields, subcategory: { key: sub.key, label: sub.label || sub.key }, masterPrompt: sub.masterPrompt, error: null };
 }
 
 /* ── the job's files ──────────────────────────────────────────────────────── */
@@ -288,7 +296,7 @@ function resolveTokens(text, ctx) {
       const key = name.slice('userInputs.'.length);
       const { value, caseMismatch } = valueOf(ui, key);
       if (caseMismatch) warn(`{{${name}}} matched the input "${caseMismatch}" only by ignoring case — fix the token's case`);
-      else if (!fieldKeys.has(key) && !allKeys.has(key)) warn(`{{${name}}} matches no field on this template — it resolved to nothing`);
+      else if (!fieldKeys.has(key) && !allKeys.has(key)) warn(`{{${name}}} matches no field for this run — it resolved to nothing`);
       return value;
     }
     // Image token. Case-insensitive fallback, same as inputs.
@@ -296,7 +304,7 @@ function resolveTokens(text, ctx) {
     const hit = [...attached.keys()].find((k) => k.toLowerCase() === name.toLowerCase());
     if (hit) { warn(`{{${name}}} matched the image "${hit}" only by ignoring case — fix the token's case`); return attached.get(hit); }
     const known = [...allKeys].some((k) => k.toLowerCase() === name.toLowerCase());
-    if (!known) warn(`{{${name}}} matches no field on this template — it resolved to nothing`);
+    if (!known) warn(`{{${name}}} matches no field for this run — it resolved to nothing`);
     return '';   // a real image that is not on this call (not uploaded, or not sent to tiles)
   };
 
