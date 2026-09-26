@@ -77,7 +77,9 @@ const INLINE_MAX = parseInt(process.env.ECOMM_INLINE_MAX || '120000', 10);
 // skip silently feeds the planner a half-empty analysis. One schema, asserted.
 const MIN_ANALYSIS_CHARS = 200;
 
-const INHERITING_KINDS = new Set(['regen_all', 'regen_one']);
+const EDIT_KINDS = new Set(['edit_all', 'edit_one']);
+const INHERITING_KINDS = new Set(['regen_all', 'regen_one', 'edit_all', 'edit_one']);
+const MAX_EDIT_PRODUCT_IMAGES = parseInt(process.env.ECOMM_EDIT_PRODUCT_IMAGES || '3', 10);
 
 /* ── DynamoDB plumbing (mirrors toolsRunner) ──────────────────────────────── */
 
@@ -585,6 +587,203 @@ async function generateTiles({ template, jobId, run, analysis, tilePlan, targets
   ));
 }
 
+/* ── EDIT — a pixel operation, not a prompt one ────────────────────────────────
+ * An edit revises the IMAGE. It reads the tile's current picture, sends it to
+ * the image model with the instruction, and merges the result back. It never
+ * touches the master prompt, the analyser or the role picker.
+ *
+ * The earlier alternative — append the instruction to the tile prompt and
+ * regenerate — loses everything that was never in words (a particular light, a
+ * particular grain) on every single edit, and the instructions stack until they
+ * argue with each other. Editing pixels carries all of it forward for free.
+ *
+ * The set's tilePlan and analysis are carried onto the edit job unchanged, so a
+ * later regen_one sourced from it still has the role to re-render from.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+function buildPixelEditPrompt(instruction, { productCount = 0, hasReference = false } = {}) {
+  const parts = ['IMAGE 1 is the tile to revise — it is the subject of this task and the basis of the output. '
+    + 'Its scene, background, surface, props, framing, crop, camera angle, lighting, shadows, reflections, '
+    + 'typography and colour grade are the ones that carry through to the result.'];
+  let n = 2;
+
+  let productLabel = '';
+  if (productCount) {
+    const last = n + productCount - 1;
+    const one = productCount === 1;
+    productLabel = one ? `IMAGE ${n}` : `IMAGES ${n}–${last}`;
+    parts.push(
+      `${productLabel} ${one ? 'is the original product photo' : 'are the original product photos'} the seller uploaded, ` +
+      `attached ONLY so you can see the product clearly. Read ${one ? 'it' : 'them'} for the product itself and nothing ` +
+      'else: its shape, proportions, packaging, label artwork, logo, lettering, typography, materials, colour and finish. ' +
+      `${one ? 'It contributes' : 'They contribute'} nothing else to the output — ignore ${one ? 'its' : 'their'} ` +
+      'background, scene, surface, props, composition, crop, scale, orientation, camera angle, distance, lighting, ' +
+      `shadows, reflections and colour grade entirely. Never paste ${one ? 'it' : 'them'} into the result, never let ` +
+      `${one ? 'its' : 'their'} framing pull the picture toward a plain pack shot, and never add a second product to the frame.`
+    );
+    n = last + 1;
+  }
+
+  if (hasReference) {
+    parts.push(
+      `IMAGE ${n} is a REFERENCE, supplied only as visual guidance. It is not the subject, it is never the output, ` +
+      'and nothing from it may appear in the result except the one specific thing the instruction asks you to take ' +
+      'from it. Ignore its product, packaging, branding, text, composition, camera angle, lighting and colour unless ' +
+      'the instruction explicitly names that aspect.'
+    );
+  }
+
+  const total = 1 + productCount + (hasReference ? 1 : 0);
+  const multi = total > 1;
+  const subject = multi ? 'IMAGE 1' : 'the tile';
+
+  const head = multi
+    ? `You are given ${total} images. ${parts.join(' ')}\n\nRevise IMAGE 1 as follows:\n\n${instruction}\n\n`
+    : `Edit the attached marketplace tile as follows:\n\n${instruction}\n\n`;
+
+  const product = productCount
+    ? `Do not redraw or restyle the product: its packaging, label artwork, logo, lettering, typography and finish must match ${productLabel} exactly. `
+      + `If the product in IMAGE 1 has drifted from ${productLabel}, bring it back to match — but keep it sitting, scaled, angled, lit, shaded and colour-graded exactly as it is in IMAGE 1. `
+      + `${productLabel} fixes WHAT the product is, never how it is photographed. `
+    : 'Do not redraw or restyle the product: its packaging, label artwork, logo, lettering and finish must survive unchanged. ';
+
+  return head +
+    `Everything else in ${subject} stays exactly as it is — the same product, the same person, the same ` +
+    'composition, the same camera angle, the same lighting, the same background, unless the change described ' +
+    'above genuinely requires otherwise. ' + product +
+    'Any text already rendered in the tile stays exactly as it appears — same words, same script, same ' +
+    'typeface, same size, same position, same line breaks — unless the change names it. Do not re-lay-out the ' +
+    `frame. This is a revision of ${subject}, not a new tile on the same idea.`;
+}
+
+/**
+ * The product photos an edit may show the model, with the names the fields gave
+ * them. Best effort: a template whose fields no longer resolve still edits, it
+ * just labels the photos generically.
+ */
+function editProductImages(template, job) {
+  try {
+    const { fields, error } = inputs.fieldsFor(template, job.subcategory);
+    if (!error) {
+      const { images } = inputs.imagePlan(fields, job.inputFiles);
+      if (images.length) return images.map((im) => ({ url: im.url, name: im.name }));
+    }
+  } catch (_) { /* fall through to the plain list */ }
+  return resolveUploads(job.inputFiles)
+    .map((url, i) => ({ url, name: i === 0 ? 'FRONT OF PACK' : `PRODUCT PHOTO ${i + 1}` }));
+}
+
+/** One tile's pixel edit. Same generator config the tile was made with. */
+async function runEditTile({ template, jobId, index, sourceUrl, products, referenceUrl, instruction }) {
+  const g = template.generator || {};
+  const human = index + 1;
+
+  const prompt = buildPixelEditPrompt(instruction, {
+    productCount: products.length,
+    hasReference: !!referenceUrl,
+  });
+
+  // Order IS the contract — it must match the numbering in the prompt above.
+  const imageUrls = [sourceUrl, ...products.map((p) => p.url), ...(referenceUrl ? [referenceUrl] : [])];
+  const imageLabels = [
+    'EDIT SUBJECT',
+    ...products.map((p, i) => (products.length > 1 ? `PRODUCT PHOTO ${i + 1} — ${p.name}` : `PRODUCT PHOTO — ${p.name}`)),
+    ...(referenceUrl ? ['GUIDANCE REFERENCE'] : []),
+  ];
+
+  console.log(`[ecommRunner] edit tile ${human}: prompt ${prompt.length} chars, ${imageUrls.length} image(s) [${imageLabels.join(', ')}]`);
+
+  const adapter = resolveProvider(g.provider);
+  const result = await adapter.execute({
+    prompt,
+    imageUrls,
+    model: g.model || 'gpt-image-2',
+    quality: g.quality || 'high',
+    resolution: g.resolution || '2k',
+    inputs: {
+      aspectRatio: g.aspectRatio || '1:1',
+      imageLabels,
+      suppressManifest: true,
+    },
+    stepId: `ecomm_${jobId}_edit`,
+    tileIndex: human,
+  });
+
+  const url = result && result.outputs && result.outputs[0] && result.outputs[0].url;
+  if (!url) throw new Error(`edit of tile ${human}: generator returned no image url`);
+  return url;
+}
+
+async function runEcommEdit(jobId, job, template, startTime) {
+  const source = await loadSourceState(job);
+  if (!source) throw new Error('edit job has no sourceJobId or parentJobId');
+
+  const instruction = String(job.editInstruction || '').trim();
+  if (!instruction) throw new Error('edit job has no editInstruction');
+
+  // The set as it stands, keyed by slot. An edit reads pixels, not prompts.
+  const bySlot = new Map();
+  source.finalOutputs.forEach((o, i) => bySlot.set(slotOfLabel(o, i), o));
+  if (!bySlot.size) throw new Error(`source run ${source.jobId} has no images to edit`);
+
+  const single = job.jobKind === 'edit_one';
+  const asked = single ? [parseInt(job.tileIndex, 10)] : [...bySlot.keys()].sort((a, b) => a - b);
+  if (single && !Number.isInteger(asked[0])) {
+    throw new Error(`tileIndex ${job.tileIndex} is not a tile on this run`);
+  }
+
+  const targets = asked.filter((i) => {
+    const out = bySlot.get(i);
+    return out && out.url && out.type !== 'video';
+  });
+  if (!targets.length) {
+    throw new Error(single
+      ? `tile ${asked[0] + 1} has no editable image on source run ${source.jobId}`
+      : 'no editable images on the source run');
+  }
+
+  const referenceUrl = String(job.editReferenceUrl || '').trim() || null;
+  const products = editProductImages(template, job).slice(0, MAX_EDIT_PRODUCT_IMAGES);
+
+  // Snapshot invariant: carry the set's plan and analysis onto this job, so a
+  // later regen_one sourced from here still has the role to re-render from.
+  const carried = { status: 'stage_generators', currentStepLabel: `Editing ${targets.length} tile(s)...` };
+  if (source.analysis != null) {
+    const stored = await persistLarge(jobId, 'analysis', source.analysis);
+    if (stored.inline != null) carried.analysisOutput = stored.inline;
+    else { carried.analysisOutput = null; carried.analysisS3Key = stored.key; }
+  }
+  if (Array.isArray(source.tilePlan) && source.tilePlan.length) {
+    const stored = await persistLarge(jobId, 'tilePlan', source.tilePlan);
+    if (stored.inline != null) carried.tilePlan = stored.inline;
+    else { carried.tilePlan = []; carried.tilePlanS3Key = stored.key; }
+  }
+  await updateJobStatus(jobId, carried);
+
+  console.log(
+    `[ecommRunner] ${job.jobKind} (pixel) from ${source.jobId} — tiles ${targets.map(i => i + 1).join(', ')}` +
+    `${products.length ? ` · +${products.length} product` : ''}${referenceUrl ? ' · +reference' : ''} · "${instruction.slice(0, 80)}"`
+  );
+
+  const settled = await Promise.allSettled(targets.map(async (slot, k) => {
+    await sleep(k * TILE_STAGGER_MS);
+    const t0 = Date.now();
+    const url = await withBackoff(`edit tile ${slot + 1}`, () => runEditTile({
+      template, jobId, index: slot,
+      sourceUrl: bySlot.get(slot).url,
+      products, referenceUrl, instruction,
+    }));
+    console.log(`[timing] job=${jobId} edit tile ${slot + 1} ${Date.now() - t0}ms`);
+    return { i: slot, url };
+  })).then(rs => rs.map((r, k) => (
+    r.status === 'fulfilled'
+      ? { ok: true, ...r.value }
+      : { ok: false, i: targets[k], error: r.reason ? r.reason.message : 'unknown error' }
+  )));
+
+  return finish({ jobId, startTime, settled, source, targets, verb: 'EDIT' });
+}
+
 /* ── shared completion ────────────────────────────────────────────────────── */
 
 async function finish({ jobId, startTime, settled, source, targets, verb }) {
@@ -648,6 +847,11 @@ async function ecommRunner(jobId, messageBody) {
     }
 
     const kind = job.jobKind || 'full';
+    if (EDIT_KINDS.has(kind)) {
+      console.log(`[ecommRunner] ${kind} — pixel edit: no analyser, no role picker, no master prompt`);
+      return await runEcommEdit(jobId, job, template, startTime);
+    }
+
     const tileCount = clampTileCount(template.tileCount);
     const scope = (messageBody && messageBody._ecommTestScope) || 'full';   // 'analyser'|'planner'|'tile'|'full'
     const mode = pipelineModeOf(template);
@@ -815,6 +1019,6 @@ module.exports = {
   ecommRunner,
   runAnalyser, runPlanner, runGenerator,
   runDirectTile, pipelineModeOf, analyserEnabled, runRolePicker, validateRoles,
-  // exported for the admin test routes and for unit tests
+  runEcommEdit, runEditTile, buildPixelEditPrompt, editProductImages,
   clampTileCount, resolveUploads, mergeOutputs, assertAnalysis, prepareRunInputs, masterPromptOf,
 };
