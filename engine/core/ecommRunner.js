@@ -5,6 +5,7 @@ const { uploadBufferToS3 } = require('./s3Uploader');
 const { buildSingleTilePrompt, buildDirectTilePrompt } = require('./singleTileEnvelope');
 const { plannerInstruction, validateTilePlan } = require('./plannerContract');
 const inputs = require('./ecommInputs');
+const { buildAdaptPrompt, withStandingRules, finishTile } = require('./ecommFinish');
 
 // ─── core/ecommRunner.js ─────────────────────────────────────────── Phase 3 ──
 //
@@ -702,11 +703,10 @@ function editProductImages(template, job) {
 }
 
 /** One tile's pixel edit. Same generator config the tile was made with. */
-async function runEditTile({ template, jobId, index, sourceUrl, products, referenceUrl, instruction }) {
+async function runEditTile({ template, jobId, index, sourceUrl, products, referenceUrl, instruction, aspectRatio, prompt: readyPrompt }) {
   const g = template.generator || {};
   const human = index + 1;
-
-  const prompt = buildPixelEditPrompt(instruction, {
+  const prompt = readyPrompt || buildPixelEditPrompt(instruction, {
     productCount: products.length,
     hasReference: !!referenceUrl,
   });
@@ -729,7 +729,7 @@ async function runEditTile({ template, jobId, index, sourceUrl, products, refere
     quality: g.quality || 'high',
     resolution: g.resolution || '2k',
     inputs: {
-      aspectRatio: g.aspectRatio || '1:1',
+      aspectRatio: aspectRatio || g.aspectRatio || '1:1',   // an adapted set has its own shape
       imageLabels,
       suppressManifest: true,
     },
@@ -772,6 +772,7 @@ async function runEcommEdit(jobId, job, template, startTime) {
 
   const referenceUrl = String(job.editReferenceUrl || '').trim() || null;
   const products = editProductImages(template, job).slice(0, MAX_EDIT_PRODUCT_IMAGES);
+  const spec = job.outputSpec && job.outputSpec.width ? job.outputSpec : null;
 
   // Snapshot invariant: carry the set's plan and analysis onto this job, so a
   // later regen_one sourced from here still has the role to re-render from.
@@ -799,10 +800,14 @@ async function runEcommEdit(jobId, job, template, startTime) {
     const url = await withBackoff(`edit tile ${slot + 1}`, () => runEditTile({
       template, jobId, index: slot,
       sourceUrl: bySlot.get(slot).url,
-      products, referenceUrl, instruction,
+      products, referenceUrl,
+      instruction: spec ? withStandingRules(instruction, spec, slot === 0 ? 'main' : 'other') : instruction,
+      aspectRatio: spec ? spec.aspectRatio : undefined,
     }));
     console.log(`[timing] job=${jobId} edit tile ${slot + 1} ${Date.now() - t0}ms`);
-    return { i: slot, url };
+    if (!spec) return { i: slot, url };
+    const done = await finishAndStore({ jobId, slot, url, spec });
+    return { i: slot, url: done.url, checks: done.checks };
   })).then(rs => rs.map((r, k) => (
     r.status === 'fulfilled'
       ? { ok: true, ...r.value }
@@ -810,6 +815,172 @@ async function runEcommEdit(jobId, job, template, startTime) {
   )));
 
   return finish({ jobId, startTime, settled, source, targets, verb: 'EDIT' });
+}
+
+/* ── ADAPT — the same set, made for another marketplace ───────────────────── */
+
+/** Finishing pass + upload. Returns the delivered URL and the check results. */
+async function finishAndStore({ jobId, slot, url, spec }) {
+  const t0 = Date.now();
+  const done = await finishTile({ url, spec, isMain: slot === 0 });
+  const key = `ai-outputs/ecomm_${jobId}_${spec.marketplaceId || 'mp'}_t${slot + 1}_${Date.now()}.${done.ext}`;
+  const outUrl = await uploadBufferToS3(done.buffer, key, done.contentType);
+  const failed = done.checks.filter((c) => !c.ok);
+  console.log(
+    `[ecommRunner] finish tile ${slot + 1} for ${spec.label || spec.marketplaceId}: ` +
+    `${done.checks.map((c) => `${c.ok ? '✓' : '✗'} ${c.id}`).join(' ')} — ${Date.now() - t0}ms` +
+    (failed.length ? ` — ${failed.map((c) => c.detail).join('; ')}` : '')
+  );
+  return { url: outUrl, checks: done.checks };
+}
+
+/**
+ * ONE text call that looks at the 'screen' tiles and says which banned things
+ * each one shows. Returns Map(slot → [{ key, label }]) — an empty list means the
+ * tile is clean. Returns null when the look itself failed; the caller then
+ * leaves those tiles unedited and marks them "not checked", never "passed".
+ */
+async function screenTiles({ template, spec, items, bySlot }) {
+  const labels = new Map();
+  items.forEach((p) => (p.screenFor || []).forEach((s) => { if (s && s.key) labels.set(s.key, s.label || s.key); }));
+  if (!labels.size) return new Map(items.map((p) => [p.slot, []]));
+
+  const prompt = [
+    `You are checking finished product listing images against the image rules of ${spec.label}.`,
+    '',
+    'The images are attached in this order:',
+    ...items.map((p, k) => `Image ${k + 1} = TILE ${p.slot + 1}`),
+    '',
+    'For EACH tile, say which of these things are visibly present in it:',
+    ...[...labels].map(([key, label]) => `- ${key}: ${label}`),
+    '',
+    'HOW TO JUDGE',
+    '* Report only what you can actually see in the image.',
+    '* Text printed on the product pack itself never counts.',
+    '* A claim such as "dermatologically tested" is not a rating. A row of stars, a score such as "4.8/5" or a customer quote is.',
+    '* A before/after of the same product is not a comparison with other brands. Naming or showing another brand is.',
+    '* When you are not sure, do not report it.',
+    '',
+    'Return JSON only, nothing before or after it:',
+    '{"tiles":[{"tile":2,"found":["price"],"what":"short note on what you saw, or empty"}]}',
+    'List every tile, with "found": [] when it is clean. Use only the keys listed above.',
+  ].join('\n');
+
+  try {
+    const t0 = Date.now();
+    const parsed = await callAgent({
+      label: 'adapt-screen',
+      prompt,
+      model: (template.planner || {}).model,
+      images: items.map((p) => bySlot.get(p.slot).url),
+      attachments: [],
+      expectJson: true,
+      maxOutputTokens: 4000,
+    });
+    const rows = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.tiles) ? parsed.tiles : null);
+    if (!rows) throw new Error('response has no `tiles` array');
+
+    const out = new Map(items.map((p) => [p.slot, []]));
+    rows.forEach((r) => {
+      const slot = parseInt(r && r.tile, 10) - 1;
+      if (!out.has(slot)) return;
+      const found = (Array.isArray(r.found) ? r.found : []).map((k) => String(k)).filter((k) => labels.has(k));
+      out.set(slot, [...new Set(found)].map((key) => ({ key, label: labels.get(key) })));
+      if (found.length) console.log(`[ecommRunner] screen: tile ${slot + 1} shows ${found.join(', ')}${r.what ? ` — ${String(r.what).slice(0, 120)}` : ''}`);
+    });
+    console.log(`[ecommRunner] screen: ${items.length} tile(s) looked at in ${Date.now() - t0}ms — ${[...out.values()].filter((f) => f.length).length} need an edit`);
+    return out;
+  } catch (err) {
+    console.error(`[ecommRunner] screen FAILED — tiles ${items.map((p) => p.slot + 1).join(', ')} will be marked "not checked": ${err.message}`);
+    return null;
+  }
+}
+
+async function runEcommAdapt(jobId, job, template, startTime) {
+  const source = await loadSourceState(job);
+  if (!source) throw new Error('adapt job has no sourceJobId');
+
+  const spec = job.outputSpec;
+  if (!spec || !spec.width || !spec.height) throw new Error('adapt job has no outputSpec');
+
+  const bySlot = new Map();
+  source.finalOutputs.forEach((o, i) => bySlot.set(slotOfLabel(o, i), o));
+
+  const work = (Array.isArray(job.adaptPlan) ? job.adaptPlan : []).filter((p) => {
+    if (!p || p.action === 'drop' || !Number.isInteger(p.slot)) return false;
+    const out = bySlot.get(p.slot);
+    return out && out.url && out.type !== 'video';
+  });
+  if (!work.length) throw new Error(`source run ${source.jobId} has no images to adapt`);
+
+  const products = editProductImages(template, job).slice(0, MAX_EDIT_PRODUCT_IMAGES);
+
+  // Snapshot invariant: the tile captions and the analysis travel with the set.
+  const carried = { status: 'stage_generators', currentStepLabel: `Checking your images against ${spec.label}'s rules...` };
+  if (source.analysis != null) {
+    const stored = await persistLarge(jobId, 'analysis', source.analysis);
+    if (stored.inline != null) carried.analysisOutput = stored.inline;
+    else { carried.analysisOutput = null; carried.analysisS3Key = stored.key; }
+  }
+  if (Array.isArray(source.tilePlan) && source.tilePlan.length) {
+    const stored = await persistLarge(jobId, 'tilePlan', source.tilePlan);
+    if (stored.inline != null) carried.tilePlan = stored.inline;
+    else { carried.tilePlan = []; carried.tilePlanS3Key = stored.key; }
+  }
+  await updateJobStatus(jobId, carried);
+
+  // Look before editing: which 'screen' tiles really show something banned?
+  const screens = work.filter((p) => p.action === 'screen');
+  const found = screens.length ? await screenTiles({ template, spec, items: screens, bySlot }) : new Map();
+  const foundIn = (p) => (found && found.get(p.slot)) || [];
+  const needsModel = (p) => p.action === 'edit' || (p.action === 'screen' && foundIn(p).length > 0);
+  const edits = work.filter(needsModel);
+
+  await updateJobStatus(jobId, { currentStepLabel: `Adapting ${work.length} image(s) for ${spec.label}...` });
+  console.log(
+    `[ecommRunner] adapt from ${source.jobId} → ${spec.label} (${spec.width}x${spec.height} ${spec.format}, model shape ${spec.aspectRatio}) — ` +
+    `${edits.length} model call(s) [tiles ${edits.map((p) => p.slot + 1).join(', ') || '—'}], ` +
+    `${work.length - edits.length} code only${products.length ? ` · +${products.length} product photo(s)` : ''}`
+  );
+
+  const settled = await Promise.allSettled(work.map(async (p) => {
+    const slot = p.slot;
+    const t0 = Date.now();
+    let url = bySlot.get(slot).url;
+    const hits = foundIn(p);
+
+    if (needsModel(p)) {
+      await sleep(edits.indexOf(p) * TILE_STAGGER_MS);      // only model calls are staggered
+      const instruction = hits.length
+        ? `- This tile shows ${hits.map((h) => h.label).join('; ')}. Remove that, and change nothing else that the rules below do not need.\n${p.instruction}`
+        : p.instruction;
+      const prompt = buildAdaptPrompt(instruction, { label: spec.label, role: p.role, productCount: products.length });
+      url = await withBackoff(`adapt tile ${slot + 1}`, () => runEditTile({
+        template, jobId, index: slot, sourceUrl: bySlot.get(slot).url,
+        products, referenceUrl: null, instruction,
+        aspectRatio: spec.aspectRatio, prompt,
+      }));
+    }
+
+    const done = await finishAndStore({ jobId, slot, url, spec });
+    const checks = [...done.checks];
+    if (p.action === 'screen') {
+      checks.push(
+        found === null ? { id: 'content', ok: false, detail: 'Could not be checked automatically — look at this image yourself' }
+          : hits.length ? { id: 'content', ok: true, detail: `Removed: ${hits.map((h) => h.label).join(', ')}` }
+            : { id: 'content', ok: true, detail: 'Nothing banned found' }
+      );
+    }
+    console.log(`[timing] job=${jobId} adapt tile ${slot + 1} (${needsModel(p) ? 'model' : 'code'}) ${Date.now() - t0}ms`);
+    return { i: slot, url: done.url, checks };
+  })).then((rs) => rs.map((r, k) => (
+    r.status === 'fulfilled'
+      ? { ok: true, ...r.value }
+      : { ok: false, i: work[k].slot, error: r.reason ? r.reason.message : 'unknown error' }
+  )));
+
+  // source: null — nothing from the original set is merged into the new one.
+  return finish({ jobId, startTime, settled, source: null, targets: work.map((p) => p.slot), verb: 'ADAPT' });
 }
 
 /* ── shared completion ────────────────────────────────────────────────────── */
@@ -838,9 +1009,15 @@ async function finish({ jobId, startTime, settled, source, targets, verb }) {
     return { success: false, jobId, error: 'all tiles failed' };
   }
 
+  const compliance = {};
+  produced.forEach((r) => {
+    if (Array.isArray(r.checks)) compliance[String(r.i + 1)] = { ok: r.checks.every((c) => c.ok), checks: r.checks };
+  });
+
   await updateJobStatus(jobId, {
     status: 'complete',            // §9: NEVER "completed" — every poller checks for this exact string
     finalOutputs,
+    ...(Object.keys(compliance).length ? { compliance } : {}),
     tileErrors,
     jobDurationMs,
     completedAt: new Date().toISOString(),
@@ -875,6 +1052,10 @@ async function ecommRunner(jobId, messageBody) {
     }
 
     const kind = job.jobKind || 'full';
+    if (kind === 'adapt') {
+      console.log('[ecommRunner] adapt — tiles re-made for another marketplace: no analyser, no role picker, no master prompt');
+      return await runEcommAdapt(jobId, job, template, startTime);
+    }
     if (EDIT_KINDS.has(kind)) {
       console.log(`[ecommRunner] ${kind} — pixel edit: no analyser, no role picker, no master prompt`);
       return await runEcommEdit(jobId, job, template, startTime);
@@ -1048,5 +1229,6 @@ module.exports = {
   runAnalyser, runPlanner, runGenerator,
   runDirectTile, pipelineModeOf, analyserEnabled, runRolePicker, validateRoles,
   runEcommEdit, runEditTile, buildPixelEditPrompt, editProductImages,
+  runEcommAdapt, finishAndStore, screenTiles,
   clampTileCount, resolveUploads, mergeOutputs, assertAnalysis, prepareRunInputs, masterPromptOf,
 };
