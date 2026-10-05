@@ -185,6 +185,11 @@ function statusFromError(err) {
   return m ? parseInt(m[1], 10) : null;
 }
 
+function isNetworkError(err) {
+  return /ECONNABORTED|ETIMEDOUT|ECONNRESET|EPIPE|socket hang up|timeout of \d+ms/i
+    .test(String(err && err.message) || '');
+}
+
 async function withBackoff(label, fn, attempts = TILE_RETRY_ATTEMPTS) {
   let lastErr;
   for (let i = 1; i <= attempts; i++) {
@@ -193,9 +198,10 @@ async function withBackoff(label, fn, attempts = TILE_RETRY_ATTEMPTS) {
     } catch (err) {
       lastErr = err;
       const status = statusFromError(err);
-      if (!status || i === attempts) break;
+      const net = isNetworkError(err);
+      if ((!status && !net) || i === attempts) break;
       const wait = Math.round(2000 * Math.pow(2, i - 1) + Math.random() * 1000);
-      console.warn(`[ecommRunner] ${label}: ${status} — retry ${i}/${attempts - 1} in ${wait}ms (shared quota; not your code)`);
+      console.warn(`[ecommRunner] ${label}: ${status || 'network/timeout'} — retry ${i}/${attempts - 1} in ${wait}ms`);
       await sleep(wait);
     }
   }

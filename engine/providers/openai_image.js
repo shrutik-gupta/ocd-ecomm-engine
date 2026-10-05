@@ -4,6 +4,8 @@ const sharp = require('sharp');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { uploadBufferToS3 } = require('../core/s3Uploader');
 
+const API_TIMEOUT_MS = parseInt(process.env.OPENAI_IMAGE_TIMEOUT_MS || '150000', 10);
+
 const OPENAI_IMAGE_MODELS = {
   'gpt-image-2':         { qualities: ['low', 'medium', 'high', 'auto'],                 maxPixels: null },
   'gpt-image-2.5-flare': { qualities: ['low', 'medium', 'high', 'xhigh', 'max', 'auto'], maxPixels: 8294400 },
@@ -417,15 +419,19 @@ async function execute({ prompt, inputs, imageUrls, model, quality, resolution, 
     };
     const doPost = (form) => axios.post('https://api.openai.com/v1/images/edits', form, {
       headers: { 'Authorization': `Bearer ${apiKey}`, ...form.getHeaders() },
-      timeout: 300000,
+      timeout: API_TIMEOUT_MS,
       maxBodyLength: Infinity,
       maxContentLength: Infinity,
     });
 
     const fail = (e) => {
-      console.error('[openai_image] edits ERROR BODY:', JSON.stringify(e.response?.data));
+      const status = e.response?.status || '';
+      const detail = e.response
+        ? JSON.stringify(e.response.data?.error?.message || e.response.data)
+        : `${e.code || 'NETWORK'}: ${e.message}`;   // timeout or socket error: there is no response body
+      console.error(`[openai_image] edits ERROR ${status} ${detail}`);
       console.error(`[openai_image] sent: model=${modelId} quality=${qualityVal} size=${size} refs=${uniqueRefs.length} fidelity=${sendFidelity} format=${sendFormat ? OUTPUT_FORMAT : 'png'}`);
-      throw new Error('[openai_image] OpenAI ' + (e.response?.status || '') + ': ' + JSON.stringify(e.response?.data?.error?.message || e.response?.data));
+      throw new Error(`[openai_image] OpenAI ${status}: ${detail}`);
     };
     let sendFidelity = SEND_INPUT_FIDELITY;
     let sendFormat = OUTPUT_FORMAT !== 'png';
