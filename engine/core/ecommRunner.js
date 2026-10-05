@@ -703,7 +703,7 @@ function editProductImages(template, job) {
 }
 
 /** One tile's pixel edit. Same generator config the tile was made with. */
-async function runEditTile({ template, jobId, index, sourceUrl, products, referenceUrl, instruction, aspectRatio, prompt: readyPrompt }) {
+async function runEditTile({ template, jobId, index, sourceUrl, products, referenceUrl, instruction, aspectRatio, resolution, prompt: readyPrompt }) {
   const g = template.generator || {};
   const human = index + 1;
   const prompt = readyPrompt || buildPixelEditPrompt(instruction, {
@@ -727,9 +727,9 @@ async function runEditTile({ template, jobId, index, sourceUrl, products, refere
     imageUrls,
     model: g.model || 'gpt-image-2',
     quality: g.quality || 'high',
-    resolution: g.resolution || '2k',
+    resolution: resolution || g.resolution || '2k',
     inputs: {
-      aspectRatio: aspectRatio || g.aspectRatio || '1:1',   // an adapted set has its own shape
+      aspectRatio: aspectRatio || g.aspectRatio || '1:1',
       imageLabels,
       suppressManifest: true,
     },
@@ -803,6 +803,7 @@ async function runEcommEdit(jobId, job, template, startTime) {
       products, referenceUrl,
       instruction: spec ? withStandingRules(instruction, spec, slot === 0 ? 'main' : 'other') : instruction,
       aspectRatio: spec ? spec.aspectRatio : undefined,
+      resolution: spec ? adaptResolution(spec, template) : undefined,
     }));
     console.log(`[timing] job=${jobId} edit tile ${slot + 1} ${Date.now() - t0}ms`);
     if (!spec) return { i: slot, url };
@@ -818,6 +819,15 @@ async function runEcommEdit(jobId, job, template, startTime) {
 }
 
 /* ── ADAPT — the same set, made for another marketplace ───────────────────── */
+
+// The model only has to out-size the delivery file. Every "2k" size is at least
+// 2048 px on both edges, so a file of up to 2048 px never needs "4k" — asking
+// for it pays for pixels the finishing pass throws away.
+function adaptResolution(spec, template) {
+  const long = Math.max(parseInt(spec.width, 10) || 0, parseInt(spec.height, 10) || 0);
+  if (long > 0 && long <= 2048) return '2k';
+  return (template.generator || {}).resolution || '2k';
+}
 
 /** Finishing pass + upload. Returns the delivered URL and the check results. */
 async function finishAndStore({ jobId, slot, url, spec }) {
@@ -959,6 +969,7 @@ async function runEcommAdapt(jobId, job, template, startTime) {
         template, jobId, index: slot, sourceUrl: bySlot.get(slot).url,
         products, referenceUrl: null, instruction,
         aspectRatio: spec.aspectRatio, prompt,
+        resolution: adaptResolution(spec, template),
       }));
     }
 

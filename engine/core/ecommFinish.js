@@ -26,7 +26,9 @@ const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 //     aspectRatio,                 ratio to ask the image model for (one it supports)
 //     width, height,               exact delivery pixels
 //     format: 'jpeg' | 'png',
-//     maxBytes, minLongEdgePx,
+//     maxBytes, minBytes,          file weight limits in bytes (0 = none)
+//     maxFileMB, minFileMB,        the same limits as the row states them, for messages
+//     minLongEdgePx,
 //     main: { background: 'pure-white' | 'white-or-light-grey' | 'light-grey' | 'any', productFillPct },
 //     rules: { main: '…', other: '…' }   standing rules, reused by later edits
 //   }
@@ -41,7 +43,13 @@ const WHITE_CORNER_MIN = parseInt(process.env.ECOMM_WHITE_CORNER_MIN || '236', 1
 // How far the re-frame may scale the product, relative to a plain resize.
 const REFRAME_MIN = parseFloat(process.env.ECOMM_REFRAME_MIN || '0.6');
 const REFRAME_MAX = parseFloat(process.env.ECOMM_REFRAME_MAX || '1.5');
-const JPEG_STEPS = [92, 88, 82, 76, 70, 62];
+// JPEG quality: start at 92. Too heavy → step down. Too light (a marketplace
+// with a MINIMUM file size) → step up, and if that is not enough, deliver more pixels.
+const JPEG_START = 92;
+const JPEG_DOWN = [88, 82, 76, 70, 62];
+const JPEG_UP = [95, 98, 100];
+// How far the delivery size may grow to reach a minimum file size.
+const GROW_MAX = parseFloat(process.env.ECOMM_GROW_MAX || '1.5');
 
 /* ── the prompt for the model call ────────────────────────────────────────── */
 
@@ -217,19 +225,44 @@ const fillOf = (box, w, h) => Math.max(box.width / w, box.height / h);
 
 /* ── encoding ─────────────────────────────────────────────────────────────── */
 
+const kb = (bytes) => (bytes >= 1048576 ? `${(bytes / 1048576).toFixed(2)} MB` : `${Math.round(bytes / 1024)} KB`);
+
+/**
+ * Encodes raw RGB to the format the marketplace wants, aiming for a file
+ * between minBytes and maxBytes. It gets as close as quality alone allows;
+ * the caller tries a larger canvas when the result is still too light.
+ */
 async function encode(raw, w, h, spec) {
   const img = () => sharp(raw, { raw: { width: w, height: h, channels: 3 } }).withMetadata({ density: 72 });
   const maxBytes = parseInt(spec.maxBytes, 10) || 0;
+  const minBytes = parseInt(spec.minBytes, 10) || 0;
 
   if (spec.format === 'png') {
     const buffer = await img().png({ compressionLevel: 9 }).toBuffer();
     return { buffer, ext: 'png', contentType: 'image/png', quality: null };
   }
-  let buffer = null, quality = JPEG_STEPS[0];
-  for (const q of JPEG_STEPS) {
-    quality = q;
-    buffer = await img().jpeg({ quality: q, chromaSubsampling: q >= 88 ? '4:4:4' : '4:2:0', mozjpeg: true }).toBuffer();
-    if (!maxBytes || buffer.length <= maxBytes) break;
+
+  // mozjpeg squeezes the file hard; above 95 it is switched off so the top
+  // qualities really do add weight.
+  const jpegAt = (q) => img().jpeg({ quality: q, chromaSubsampling: q >= 88 ? '4:4:4' : '4:2:0', mozjpeg: q <= 95 }).toBuffer();
+
+  let quality = JPEG_START;
+  let buffer = await jpegAt(quality);
+
+  if (maxBytes && buffer.length > maxBytes) {
+    for (const q of JPEG_DOWN) {
+      quality = q;
+      buffer = await jpegAt(q);
+      if (buffer.length <= maxBytes) break;
+    }
+  } else if (minBytes && buffer.length < minBytes) {
+    for (const q of JPEG_UP) {
+      const heavier = await jpegAt(q);
+      if (maxBytes && heavier.length > maxBytes) break;     // never trade one broken limit for the other
+      buffer = heavier;
+      quality = q;
+      if (buffer.length >= minBytes) break;
+    }
   }
   return { buffer, ext: 'jpg', contentType: 'image/jpeg', quality };
 }
@@ -259,57 +292,97 @@ async function finishTile({ url, buffer: given, spec, isMain = false }) {
   const onWhite = cornerWhiteness(data, sw, sh) >= WHITE_CORNER_MIN;
   const targetFill = isMain && spec.main && parseInt(spec.main.productFillPct, 10) > 0
     ? parseInt(spec.main.productFillPct, 10) / 100 : 0;
+  const whiteWork = wantWhite && onWhite;
 
-  let out = null;          // raw RGB at W×H
-  let note = '';
+  // Main image on white: true 255 background, and (below) the product re-framed.
+  if (whiteWork) snapWhite(data);
+  const found = whiteWork && targetFill ? contentBox(data, sw, sh) : null;
+  const box = found && found.width * found.height > sw * sh * 0.03 ? found : null;
 
-  // Main image on white: true 255 background, and the product re-framed to the asked fill.
-  if (wantWhite && onWhite) {
-    snapWhite(data);
-    const box = targetFill ? contentBox(data, sw, sh) : null;
-    if (box && box.width * box.height > sw * sh * 0.03) {
-      const natural = Math.min(W / sw, H / sh);
-      const wanted = targetFill * Math.min(W / box.width, H / box.height);
+  // A plain resize when there is nothing to re-frame. Same shape → exact.
+  // Different shape → the main image is padded with white, any other tile is centre-cropped.
+  const drift = Math.abs((sw / sh) - (W / H)) / (W / H);
+  const fit = drift <= 0.01 ? 'fill' : (whiteWork ? 'contain' : 'cover');
+  if (!box && fit === 'cover') {
+    checks.push({ id: 'shape', ok: drift <= 0.08, detail: `source ${sw}×${sh} is a different shape — cropped ${Math.round(drift * 100)}% to fit` });
+  }
+
+  // The tile as raw RGB at w×h. Called again with a larger canvas only when a
+  // minimum file size cannot be reached at the normal size.
+  const renderAt = async (w, h) => {
+    let out, note = '';
+    if (box) {
+      const natural = Math.min(w / sw, h / sh);
+      const wanted = targetFill * Math.min(w / box.width, h / box.height);
       const k = natural * Math.max(REFRAME_MIN, Math.min(REFRAME_MAX, wanted / natural));
-      const nw = Math.min(W, Math.max(1, Math.round(box.width * k)));
-      const nh = Math.min(H, Math.max(1, Math.round(box.height * k)));
+      const nw = Math.min(w, Math.max(1, Math.round(box.width * k)));
+      const nh = Math.min(h, Math.max(1, Math.round(box.height * k)));
       const piece = await sharp(data, { raw: { width: sw, height: sh, channels: 3 } })
         .extract(box).resize(nw, nh, { fit: 'fill', kernel: 'lanczos3' }).raw().toBuffer();
-      out = await sharp({ create: { width: W, height: H, channels: 3, background: '#ffffff' } })
-        .composite([{ input: piece, raw: { width: nw, height: nh, channels: 3 }, left: Math.floor((W - nw) / 2), top: Math.floor((H - nh) / 2) }])
+      out = await sharp({ create: { width: w, height: h, channels: 3, background: '#ffffff' } })
+        .composite([{ input: piece, raw: { width: nw, height: nh, channels: 3 }, left: Math.floor((w - nw) / 2), top: Math.floor((h - nh) / 2) }])
         .removeAlpha().raw().toBuffer();
       note = `re-framed ×${(k / natural).toFixed(2)}`;
+    } else {
+      out = await sharp(data, { raw: { width: sw, height: sh, channels: 3 } })
+        .resize(w, h, { fit, position: 'centre', background: '#ffffff', kernel: 'lanczos3' }).removeAlpha().raw().toBuffer();
+      if (fit === 'cover') note = `cropped ${Math.round(drift * 100)}% to fit`;
+    }
+    if (whiteWork) snapWhite(out);
+    return { out, note };
+  };
+
+  // The sizes to try. Normally just W×H. With a minimum file size, up to two
+  // larger canvases of the same shape — but never larger than the source, so
+  // the extra weight is real detail and not upscaled blur.
+  const maxBytes = parseInt(spec.maxBytes, 10) || 0;
+  const minBytes = parseInt(spec.minBytes, 10) || 0;
+  const sizes = [[W, H]];
+  if (minBytes && spec.format !== 'png') {
+    const room = Math.min(GROW_MAX, sw / W, sh / H);
+    if (room >= 1.08) {
+      [(1 + room) / 2, room].forEach((f) => {
+        const w = Math.round(W * f);
+        sizes.push([w, Math.round((w * H) / W)]);
+      });
     }
   }
 
-  // Everything else: a plain resize. Same shape → exact. Different shape → the
-  // main image is padded with white, any other tile is centre-cropped.
-  if (!out) {
-    const drift = Math.abs((sw / sh) - (W / H)) / (W / H);
-    const fit = drift <= 0.01 ? 'fill' : (wantWhite && onWhite ? 'contain' : 'cover');
-    out = await sharp(data, { raw: { width: sw, height: sh, channels: 3 } })
-      .resize(W, H, { fit, position: 'centre', background: '#ffffff', kernel: 'lanczos3' }).removeAlpha().raw().toBuffer();
-    if (fit === 'cover') {
-      note = `cropped ${Math.round(drift * 100)}% to fit`;
-      checks.push({ id: 'shape', ok: drift <= 0.08, detail: `source ${sw}×${sh} is a different shape — ${note}` });
-    }
+  // Take the first size whose file sits inside the limits. If none does, keep
+  // the heaviest one that is still under the maximum.
+  let pick = null;
+  for (const [w, h] of sizes) {
+    const { out, note } = await renderAt(w, h);
+    const enc = await encode(out, w, h, spec);
+    const cand = { ...enc, w, h, note };
+    const underMax = !maxBytes || enc.buffer.length <= maxBytes;
+    if (underMax && (!minBytes || enc.buffer.length >= minBytes)) { pick = cand; break; }
+    if (!pick || (underMax && enc.buffer.length > pick.buffer.length)) pick = cand;
   }
-  if (wantWhite && onWhite) snapWhite(out);
-
-  const enc = await encode(out, W, H, spec);
+  const enc = pick;
+  const grown = enc.w !== W || enc.h !== H;
 
   // ── measure what we are about to deliver ──
   const final = await sharp(enc.buffer).removeAlpha().raw().toBuffer({ resolveWithObject: true });
   const fw = final.info.width, fh = final.info.height;
   const long = Math.max(fw, fh);
   const minLong = parseInt(spec.minLongEdgePx, 10) || 0;
-  const maxBytes = parseInt(spec.maxBytes, 10) || 0;
+  const bytes = enc.buffer.length;
+  const notes = [enc.note, grown ? `larger than ${W}×${H} to reach the minimum file size` : ''].filter(Boolean).join(', ');
 
-  checks.push({ id: 'size', ok: fw === W && fh === H && (!minLong || long >= minLong), detail: `${fw}×${fh} px${note ? ` (${note})` : ''}` });
+  checks.push({ id: 'size', ok: fw === enc.w && fh === enc.h && (!minLong || long >= minLong), detail: `${fw}×${fh} px${notes ? ` (${notes})` : ''}` });
   checks.push({ id: 'format', ok: true, detail: `${enc.ext === 'jpg' ? 'JPEG' : 'PNG'}, sRGB${enc.quality ? `, quality ${enc.quality}` : ''}` });
+
+  const tooHeavy = !!maxBytes && bytes > maxBytes;
+  const tooLight = !!minBytes && bytes < minBytes;
+  // Limits are shown in the marketplace's own words ("500 KB to 1 MB").
+  const lim = (mb, bytesValue) => (parseFloat(mb) > 0 ? (parseFloat(mb) >= 1 ? `${parseFloat(mb)} MB` : `${Math.round(parseFloat(mb) * 1000)} KB`) : kb(bytesValue));
+  const limits = minBytes && maxBytes ? `${lim(spec.minFileMB, minBytes)} to ${lim(spec.maxFileMB, maxBytes)} allowed`
+    : maxBytes ? `${lim(spec.maxFileMB, maxBytes)} allowed`
+      : minBytes ? `at least ${lim(spec.minFileMB, minBytes)} needed` : '';
   checks.push({
-    id: 'weight', ok: !maxBytes || enc.buffer.length <= maxBytes,
-    detail: `${(enc.buffer.length / 1048576).toFixed(2)} MB${maxBytes ? ` of ${(maxBytes / 1048576).toFixed(0)} MB allowed` : ''}`,
+    id: 'weight', ok: !tooHeavy && !tooLight,
+    detail: `${kb(bytes)}${limits ? ` — ${limits}` : ''}${tooLight ? '. This image is too plain to reach the minimum' : ''}`,
   });
 
   if (isMain && mainRule !== 'any') {
@@ -324,8 +397,8 @@ async function finishTile({ url, buffer: given, spec, isMain = false }) {
       detail: pass ? want : `background measures ${white} of 255 — needs ${want}`,
     });
     if (targetFill && pass && mainRule === 'pure-white') {
-      const box = contentBox(final.data, fw, fh);
-      const pct = box ? Math.round(fillOf(box, fw, fh) * 100) : 0;
+      const measured = contentBox(final.data, fw, fh);
+      const pct = measured ? Math.round(fillOf(measured, fw, fh) * 100) : 0;
       const wantPct = Math.round(targetFill * 100);
       checks.push({ id: 'fill', ok: pct >= wantPct - 3, detail: `product fills ${pct}% of the frame (asks for ${wantPct}%)` });
     }
