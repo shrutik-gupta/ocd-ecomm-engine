@@ -5,7 +5,7 @@ const { uploadBufferToS3 } = require('./s3Uploader');
 const { buildSingleTilePrompt, buildDirectTilePrompt } = require('./singleTileEnvelope');
 const { plannerInstruction, validateTilePlan } = require('./plannerContract');
 const inputs = require('./ecommInputs');
-const { buildAdaptPrompt, withStandingRules, finishTile } = require('./ecommFinish');
+const { buildAdaptPrompt, withStandingRules, finishTile, wrapAsHtml, specForHtml } = require('./ecommFinish');
 
 // ─── core/ecommRunner.js ─────────────────────────────────────────── Phase 3 ──
 //
@@ -175,7 +175,10 @@ function slotOfLabel(out, fallback) {
 function mergeOutputs(baseOutputs, produced) {
   const bySlot = new Map();
   (baseOutputs || []).forEach((o, i) => bySlot.set(slotOfLabel(o, i) + 1, { ...o }));
-  (produced || []).forEach(({ i, url }) => bySlot.set(i + 1, { label: `Tile ${i + 1}`, type: 'image', url }));
+  (produced || []).forEach(({ i, url, htmlUrl }) => bySlot.set(i + 1, {
+    label: `Tile ${i + 1}`, type: 'image', url,
+    ...(htmlUrl ? { htmlUrl } : {}),          // set only for a marketplace that takes HTML files
+  }));
   return [...bySlot.keys()].sort((a, b) => a - b).map(k => bySlot.get(k));
 }
 
@@ -807,8 +810,8 @@ async function runEcommEdit(jobId, job, template, startTime) {
     }));
     console.log(`[timing] job=${jobId} edit tile ${slot + 1} ${Date.now() - t0}ms`);
     if (!spec) return { i: slot, url };
-    const done = await finishAndStore({ jobId, slot, url, spec });
-    return { i: slot, url: done.url, checks: done.checks };
+    const done = await finishAndStore({ jobId, slot, url, spec, title: tileHtmlTitle(job, source.tilePlan, slot) });
+    return { i: slot, url: done.url, htmlUrl: done.htmlUrl, checks: done.checks };
   })).then(rs => rs.map((r, k) => (
     r.status === 'fulfilled'
       ? { ok: true, ...r.value }
@@ -830,18 +833,42 @@ function adaptResolution(spec, template) {
 }
 
 /** Finishing pass + upload. Returns the delivered URL and the check results. */
-async function finishAndStore({ jobId, slot, url, spec }) {
+async function finishAndStore({ jobId, slot, url, spec, title }) {
   const t0 = Date.now();
-  const done = await finishTile({ url, spec, isMain: slot === 0 });
-  const key = `ai-outputs/ecomm_${jobId}_${spec.marketplaceId || 'mp'}_t${slot + 1}_${Date.now()}.${done.ext}`;
-  const outUrl = await uploadBufferToS3(done.buffer, key, done.contentType);
-  const failed = done.checks.filter((c) => !c.ok);
+  const asHtml = spec.wrap === 'html';
+  // The size limit applies to the HTML file, and base64 adds a third. So the
+  // image inside is finished to a smaller budget (specForHtml).
+  const done = await finishTile({ url, spec: asHtml ? specForHtml(spec) : spec, isMain: slot === 0 });
+  const stem = `ai-outputs/ecomm_${jobId}_${spec.marketplaceId || 'mp'}_t${slot + 1}_${Date.now()}`;
+  // The image is always stored: it is the file itself, or the preview of the HTML file.
+  const outUrl = await uploadBufferToS3(done.buffer, `${stem}.${done.ext}`, done.contentType);
+  const checks = [...done.checks];
+
+  let htmlUrl = null;
+  if (asHtml) {
+    const page = wrapAsHtml({
+      buffer: done.buffer, contentType: done.contentType, width: done.width, height: done.height,
+      title: title || `Tile ${slot + 1}`, alt: title || `Tile ${slot + 1}`, spec,
+    });
+    htmlUrl = await uploadBufferToS3(page.buffer, `${stem}.html`, page.contentType);
+    checks.push(page.check);
+  }
+
+  const failed = checks.filter((c) => !c.ok);
   console.log(
     `[ecommRunner] finish tile ${slot + 1} for ${spec.label || spec.marketplaceId}: ` +
-    `${done.checks.map((c) => `${c.ok ? '✓' : '✗'} ${c.id}`).join(' ')} — ${Date.now() - t0}ms` +
+    `${checks.map((c) => `${c.ok ? '✓' : '✗'} ${c.id}`).join(' ')} — ${Date.now() - t0}ms` +
     (failed.length ? ` — ${failed.map((c) => c.detail).join('; ')}` : '')
   );
-  return { url: outUrl, checks: done.checks };
+  return { url: outUrl, htmlUrl, checks };
+}
+
+// "TRESemmé Hydra Matrix – How to Use / Care": the <title> of a tile's HTML file.
+function tileHtmlTitle(job, tilePlan, slot) {
+  const entry = Array.isArray(tilePlan) ? tilePlan[slot] : null;
+  const tile = (entry && entry.title && String(entry.title).trim()) || `Tile ${slot + 1}`;
+  const product = String((job && job.skuName) || '').trim();
+  return product ? `${product} – ${tile}` : tile;
 }
 
 /**
@@ -973,7 +1000,7 @@ async function runEcommAdapt(jobId, job, template, startTime) {
       }));
     }
 
-    const done = await finishAndStore({ jobId, slot, url, spec });
+    const done = await finishAndStore({ jobId, slot, url, spec, title: tileHtmlTitle(job, source.tilePlan, slot) });
     const checks = [...done.checks];
     if (p.action === 'screen') {
       checks.push(
@@ -983,7 +1010,7 @@ async function runEcommAdapt(jobId, job, template, startTime) {
       );
     }
     console.log(`[timing] job=${jobId} adapt tile ${slot + 1} (${needsModel(p) ? 'model' : 'code'}) ${Date.now() - t0}ms`);
-    return { i: slot, url: done.url, checks };
+    return { i: slot, url: done.url, htmlUrl: done.htmlUrl, checks };
   })).then((rs) => rs.map((r, k) => (
     r.status === 'fulfilled'
       ? { ok: true, ...r.value }

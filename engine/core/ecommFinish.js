@@ -26,6 +26,7 @@ const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 //     aspectRatio,                 ratio to ask the image model for (one it supports)
 //     width, height,               exact delivery pixels
 //     format: 'jpeg' | 'png',
+//     wrap: 'html' | '',           'html' = also deliver the image inside an HTML file (Nykaa)
 //     maxBytes, minBytes,          file weight limits in bytes (0 = none)
 //     maxFileMB, minFileMB,        the same limits as the row states them, for messages
 //     minLongEdgePx,
@@ -404,11 +405,80 @@ async function finishTile({ url, buffer: given, spec, isMain = false }) {
     }
   }
 
-  return { buffer: enc.buffer, ext: enc.ext, contentType: enc.contentType, checks, ok: checks.every((c) => c.ok) };
+  return { buffer: enc.buffer, ext: enc.ext, contentType: enc.contentType, width: fw, height: fh, checks, ok: checks.every((c) => c.ok) };
+}
+
+/* ── HTML delivery (a marketplace that takes the tile as an HTML file) ─────── */
+
+// Base64 makes the image a third larger, and the limit applies to the HTML
+// file. So the image itself gets three quarters of the limit, less the markup.
+const HTML_SHELL_BYTES = 2048;
+
+/** The spec the IMAGE must meet so that the finished HTML file meets `spec`. */
+function specForHtml(spec) {
+  const max = parseInt(spec.maxBytes, 10) || 0;
+  const min = parseInt(spec.minBytes, 10) || 0;
+  return {
+    ...spec,
+    maxBytes: max ? Math.floor(((max - HTML_SHELL_BYTES) * 3) / 4) : 0,
+    minBytes: min ? Math.ceil((min * 3) / 4) : 0,
+    maxFileMB: 0,           // the image's own limits are derived, so show them in bytes
+    minFileMB: 0,
+  };
+}
+
+const escapeHtml = (v) => String(v == null ? '' : v)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+/**
+ * One self-contained HTML file: the finished tile, base64-encoded inside an
+ * <img>. No outside files, no scripts. The tile keeps its shape and fills the
+ * window, the same shell as the hand-made Nykaa example.
+ *
+ * returns { buffer, contentType, check }
+ */
+function wrapAsHtml({ buffer, contentType = 'image/jpeg', width, height, title, alt, spec }) {
+  const w = parseInt(width, 10) || 1;
+  const h = parseInt(height, 10) || 1;
+  const html = [
+    '<!DOCTYPE html>',
+    '<html lang="en">',
+    '<head>',
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    `<title>${escapeHtml(title || 'Listing image')}</title>`,
+    '<style>',
+    '*{box-sizing:border-box;margin:0;padding:0}',
+    'html,body{height:100%}',
+    'body{background:#ffffff;display:grid;place-items:center}',
+    `.tile{position:relative;width:min(100vw,calc(100vh * ${w} / ${h}));aspect-ratio:${w}/${h};overflow:hidden}`,
+    '.plate{position:absolute;inset:0;width:100%;height:100%;display:block}',
+    '</style>',
+    '</head>',
+    '<body>',
+    '<main class="tile">',
+    `  <img class="plate" width="${w}" height="${h}" alt="${escapeHtml(alt || title || 'Listing image')}" src="data:${contentType};base64,${buffer.toString('base64')}">`,
+    '</main>',
+    '</body>',
+    '</html>',
+    '',
+  ].join('\n');
+
+  const out = Buffer.from(html, 'utf8');
+  const max = parseInt(spec && spec.maxBytes, 10) || 0;
+  const min = parseInt(spec && spec.minBytes, 10) || 0;
+  const mb = (v, bytesValue) => (parseFloat(v) > 0 ? (parseFloat(v) >= 1 ? `${parseFloat(v)} MB` : `${Math.round(parseFloat(v) * 1000)} KB`) : kb(bytesValue));
+  const limits = min && max ? ` — ${mb(spec.minFileMB, min)} to ${mb(spec.maxFileMB, max)} allowed`
+    : max ? ` — ${mb(spec.maxFileMB, max)} allowed` : '';
+  return {
+    buffer: out,
+    contentType: 'text/html; charset=utf-8',
+    check: { id: 'html', ok: (!max || out.length <= max) && (!min || out.length >= min), detail: `HTML file ${kb(out.length)}${limits}` },
+  };
 }
 
 module.exports = {
-  buildAdaptPrompt, withStandingRules, finishTile,
+  buildAdaptPrompt, withStandingRules, finishTile, wrapAsHtml, specForHtml,
   // exported for tests
   cornerWhiteness, contentBox, snapWhite,
 };
